@@ -6,43 +6,86 @@ services:
     ports:
       - "8000:8000"
     environment:
-      WHISPER_MODEL_SIZE: large-v3
+      # ==== Model / hardware ====
+      # Модель Whisper: medium = заметно быстрее на CPU, но ниже точность чем large-v3.
+      WHISPER_MODEL_SIZE: medium
+      # Устройство: cpu (для вашего сервера без GPU).
       WHISPER_DEVICE: cpu
+      # Тип вычислений: int8 ускоряет и снижает RAM, с небольшой потерей точности.
       WHISPER_COMPUTE_TYPE: int8
-      WHISPER_CPU_THREADS: "4"
+      # Потоки на один инференс модели. Больше = быстрее до предела, но выше конкуренция CPU.
+      WHISPER_CPU_THREADS: "8"
+      # Внутренние workers CTranslate2. Для CPU обычно оставлять 1.
       WHISPER_MODEL_WORKERS: "1"
+
+      # ==== Language / task ====
+      # Фиксируем русский язык для лучшей точности (без автоопределения).
       WHISPER_LANGUAGE: ru
       WHISPER_TASK: transcribe
-      WHISPER_BEAM_SIZE: 5
-      WHISPER_BEST_OF: 5
+
+      # ==== Decode quality/speed ====
+      # Beam/best_of: выше = точнее, но сильно медленнее.
+      WHISPER_BEAM_SIZE: 2
+      WHISPER_BEST_OF: 2
+      # Температура 0.0 даёт максимально детерминированный результат.
       WHISPER_TEMPERATURE: 0.0
+      # Начальный промпт (если не нужен — пустая строка).
       WHISPER_INITIAL_PROMPT: ""
-      WHISPER_CONDITION_ON_PREVIOUS_TEXT: "true"
+      # Учитывать предыдущий текст: обычно повышает связность, но немного снижает скорость.
+      WHISPER_CONDITION_ON_PREVIOUS_TEXT: "false"
+
+      # ==== VAD and segmentation ====
+      # VAD отрезает неречевые участки до декодирования: ускоряет и уменьшает шум.
       WHISPER_VAD_FILTER: "true"
+      # Порог VAD: выше = строже, может потерять тихую речь; ниже = больше фонового шума.
       WHISPER_VAD_THRESHOLD: "0.5"
+      # Минимальная тишина для разрыва речи (мс): меньше = больше сегментов.
       WHISPER_VAD_MIN_SILENCE_DURATION_MS: "500"
+      # Дополнительный запас вокруг речи (мс): выше = меньше обрезаний концов слов.
       WHISPER_VAD_SPEECH_PAD_MS: "400"
+      # Пороги декодера: влияют на отбраковку низкокачественных сегментов.
       WHISPER_NO_SPEECH_THRESHOLD: "0.4"
       WHISPER_LOG_PROB_THRESHOLD: "-1.0"
       WHISPER_COMPRESSION_RATIO_THRESHOLD: "2.4"
+
+      # ==== Tags: <Тишина> / <Музыка> / <Неразборчиво> ====
+      # Минимальная пауза (сек) для тега <Тишина>.
       WHISPER_TAG_SILENCE_MIN_SEC: "5.0"
+      # dBFS-порог тишины: ниже (например -42) = чаще <Тишина>; выше = реже.
       WHISPER_TAG_SILENCE_DBFS: "-38.0"
+      # Минимальная длина интервала для классификации как музыка.
       WHISPER_TAG_MUSIC_MIN_SEC: "3.0"
+      # Эвристики музыки: ослабление порогов => <Музыка> появляется чаще.
       WHISPER_TAG_MUSIC_MAX_ZCR: "0.08"
       WHISPER_TAG_MUSIC_MAX_ENERGY_VARIATION: "0.35"
+      # Пороги для <Неразборчиво>: ужесточение => больше таких меток.
       WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOGPROB: "-1.15"
       WHISPER_TAG_UNINTELLIGIBLE_MIN_NO_SPEECH_PROB: "0.55"
       WHISPER_TAG_UNINTELLIGIBLE_MAX_COMPRESSION_RATIO: "2.4"
+
+      # ==== Quality guard ====
+      # Повторный прогон при аномалиях (может улучшить качество, но увеличивает время).
       WHISPER_ENABLE_QUALITY_FALLBACK: "true"
       WHISPER_MIN_UNIQUE_SEGMENT_RATIO: "0.15"
       WHISPER_MAX_TOP_REPEAT_RATIO: "0.8"
       WHISPER_MAX_PROMPT_MATCH_RATIO: "0.5"
+
+      # ==== Preprocess / runtime ====
+      # Препроцессинг в mono/16kHz — стандарт для Whisper.
       WHISPER_PREPROCESS_SAMPLE_RATE: "16000"
+      # Таймаут ffmpeg на подготовку.
       WHISPER_PREPROCESS_TIMEOUT_SEC: "1800"
+      # Для дебага можно оставить prepared wav.
       WHISPER_KEEP_PREPARED_AUDIO: "false"
-      WHISPER_WORKERS: "2"
+
+      # ==== Parallelism ====
+      # Для максимальной скорости одного файла лучше 1 воркер и все ядра на него.
+      WHISPER_WORKERS: "1"
+      # Глобальные лимиты потоков math-библиотек.
       OMP_NUM_THREADS: "8"
       MKL_NUM_THREADS: "8"
+
+      # ==== Paths ====
       HF_HOME: /app/data/huggingface
       DATABASE_PATH: /app/data/app.db
       UPLOAD_DIR: /app/data/uploads

@@ -1,54 +1,36 @@
-# WhisperIO: accuracy-first профиль для русского аудио
+# WhisperIO: настройка через docker-compose
 
-Этот проект использует `faster-whisper` и настроен под распознавание русской речи на `large-v3` с CPU.
+Проект использует `faster-whisper` с моделью `large-v3` на CPU и управляется через `docker-compose.yml`.
 
-## Рекомендованный профиль для вашего сервера
+## Что настроено
 
-Конфигурация в `docker-compose.yml` уже выставлена под:
-- `WHISPER_MODEL_SIZE=large-v3`
-- `WHISPER_DEVICE=cpu`
-- `WHISPER_COMPUTE_TYPE=int8`
-- `WHISPER_WORKERS=2`
-- `WHISPER_CPU_THREADS=4`
-- `OMP_NUM_THREADS=8`
-- `MKL_NUM_THREADS=8`
+- 2 backend-воркера (`WHISPER_WORKERS=2`)
+- Русский язык (`WHISPER_LANGUAGE=ru`)
+- Приоритет точности (`beam=5`, `best_of=5`, `condition_on_previous_text=true`)
+- Спец-теги в сегментах: `<Тишина>`, `<Музыка>`, `<Неразборчиво>`
 
-Это дает 2 параллельных backend-воркера без агрессивного oversubscription на 8 ядрах.
+## Где менять качество и скорость
 
-## Метки неречевых участков
+Все параметры вынесены в `docker-compose.yml` и подписаны комментариями:
 
-В итоговые сегменты добавляются специальные теги:
-- `<Тишина>`: для пауз длительностью от `WHISPER_TAG_SILENCE_MIN_SEC` (по умолчанию `5.0` сек).
-- `<Музыка>`: для длинных неречевых интервалов, похожих на музыку по аудио-метрикам.
-- `<Неразборчиво>`: когда модель видит речь, но сегмент имеет плохие метрики разборчивости.
+- **Модель/железо:** `WHISPER_MODEL_SIZE`, `WHISPER_COMPUTE_TYPE`, `WHISPER_CPU_THREADS`, `WHISPER_WORKERS`
+- **Качество распознавания:** `WHISPER_BEAM_SIZE`, `WHISPER_BEST_OF`, `WHISPER_CONDITION_ON_PREVIOUS_TEXT`
+- **Сегментация/VAD:** `WHISPER_VAD_*`, `WHISPER_NO_SPEECH_THRESHOLD`, `WHISPER_LOG_PROB_THRESHOLD`
+- **Метки тишины/музыки/неразборчивости:** `WHISPER_TAG_*`
 
-Теги добавляются отдельными сегментами и не заменяют нормальные речевые фрагменты.
+## Как влияют ключевые параметры
 
-## Параметры точности
-
-### Декодирование Whisper
-- `WHISPER_BEAM_SIZE` (по умолчанию `5`)
-- `WHISPER_BEST_OF` (по умолчанию `5`)
-- `WHISPER_CONDITION_ON_PREVIOUS_TEXT` (по умолчанию `true`)
-- `WHISPER_NO_SPEECH_THRESHOLD` (по умолчанию `0.4`)
-- `WHISPER_LOG_PROB_THRESHOLD` (по умолчанию `-1.0`)
-- `WHISPER_COMPRESSION_RATIO_THRESHOLD` (по умолчанию `2.4`)
-
-### VAD
-- `WHISPER_VAD_FILTER` (`true`)
-- `WHISPER_VAD_THRESHOLD` (`0.5`)
-- `WHISPER_VAD_MIN_SILENCE_DURATION_MS` (`500`)
-- `WHISPER_VAD_SPEECH_PAD_MS` (`400`)
-
-### Пороги тегов
-- `WHISPER_TAG_SILENCE_MIN_SEC` (`5.0`)
-- `WHISPER_TAG_SILENCE_DBFS` (`-38.0`)
-- `WHISPER_TAG_MUSIC_MIN_SEC` (`3.0`)
-- `WHISPER_TAG_MUSIC_MAX_ZCR` (`0.08`)
-- `WHISPER_TAG_MUSIC_MAX_ENERGY_VARIATION` (`0.35`)
-- `WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOGPROB` (`-1.15`)
-- `WHISPER_TAG_UNINTELLIGIBLE_MIN_NO_SPEECH_PROB` (`0.55`)
-- `WHISPER_TAG_UNINTELLIGIBLE_MAX_COMPRESSION_RATIO` (`2.4`)
+- `WHISPER_BEAM_SIZE` и `WHISPER_BEST_OF`:
+  - выше -> лучше точность, медленнее обработка
+  - ниже -> быстрее, больше ошибок
+- `WHISPER_COMPUTE_TYPE`:
+  - `int8` -> быстрее и меньше RAM, чем float
+- `WHISPER_WORKERS`:
+  - больше воркеров -> выше throughput очереди
+  - один файл быстрее не станет, но несколько файлов обрабатываются параллельно
+- `WHISPER_CPU_THREADS`:
+  - выше -> может ускорить один инференс до упора CPU
+  - слишком высоко -> конкуренция потоков и нестабильная производительность
 
 ## Запуск
 
@@ -56,17 +38,12 @@
 docker compose up --build
 ```
 
-API backend: `http://localhost:8000`  
+Backend API: `http://localhost:8000`  
 Frontend: `http://localhost:3000`
 
-## Практика тонкой подстройки
+## Быстрая практическая подстройка
 
-- Если слишком много `<Неразборчиво>`, сначала ослабьте:
-  - `WHISPER_TAG_UNINTELLIGIBLE_MIN_NO_SPEECH_PROB` (ниже),
-  - `WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOGPROB` (ниже по модулю, например `-1.25`).
-- Если `<Музыка>` срабатывает редко:
-  - увеличьте `WHISPER_TAG_MUSIC_MAX_ZCR`,
-  - увеличьте `WHISPER_TAG_MUSIC_MAX_ENERGY_VARIATION`.
-- Если в системе высокий CPU wait и очередь растет:
-  - уменьшите `WHISPER_BEAM_SIZE` / `WHISPER_BEST_OF` до `4` или `3`,
-  - оставьте `WHISPER_WORKERS=2`, но уменьшите `WHISPER_CPU_THREADS` до `3`.
+- Нужно быстрее: снизьте `WHISPER_BEAM_SIZE` и `WHISPER_BEST_OF` до `4` или `3`.
+- Нужно точнее: верните `5/5`, при необходимости уменьшите `WHISPER_WORKERS` до `1`.
+- Слишком много `<Неразборчиво>`: ослабьте пороги `WHISPER_TAG_UNINTELLIGIBLE_*`.
+- Слишком мало `<Музыка>`: немного увеличьте `WHISPER_TAG_MUSIC_MAX_ZCR` и `WHISPER_TAG_MUSIC_MAX_ENERGY_VARIATION`.
