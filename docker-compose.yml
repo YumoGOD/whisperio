@@ -1,0 +1,45 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: whisperio-backend
+    ports:
+      - "8000:8000"
+    environment:
+      WHISPER_MODEL_SIZE: large-v3
+      WHISPER_DEVICE: cpu
+      WHISPER_COMPUTE_TYPE: int8
+      WHISPER_LANGUAGE: ru
+      WHISPER_TASK: transcribe
+      WHISPER_BEAM_SIZE: 3
+      WHISPER_BEST_OF: 3
+      WHISPER_TEMPERATURE: 0.0
+      WHISPER_INITIAL_PROMPT: ""
+      WHISPER_CONDITION_ON_PREVIOUS_TEXT: "false"
+      WHISPER_VAD_FILTER: "true"
+      WHISPER_ENABLE_QUALITY_FALLBACK: "true"
+      WHISPER_MIN_UNIQUE_SEGMENT_RATIO: "0.15"
+      WHISPER_MAX_TOP_REPEAT_RATIO: "0.8"
+      WHISPER_MAX_PROMPT_MATCH_RATIO: "0.5"
+      WHISPER_PREPROCESS_SAMPLE_RATE: "16000"
+      WHISPER_PREPROCESS_TIMEOUT_SEC: "1800"
+      WHISPER_KEEP_PREPARED_AUDIO: "false"
+      WHISPER_WORKERS: "1"
+      HF_HOME: /app/data/huggingface
+      DATABASE_PATH: /app/data/app.db
+      UPLOAD_DIR: /app/data/uploads
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: http://localhost:8000
+    container_name: whisperio-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
