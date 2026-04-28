@@ -40,5 +40,9 @@ pnpm-debug.log*
 *.tmp
 *.temp
 
-# Local data/cache artifacts
-data/huggingface/
+# Local database and data artifacts
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+data/
