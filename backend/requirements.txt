@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 python-multipart
 faster-whisper==1.2.1
+psutil

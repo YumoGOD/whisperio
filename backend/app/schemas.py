@@ -16,6 +16,9 @@ class SegmentOut(BaseModel):
 class JobBase(BaseModel):
     id: str
     original_filename: str
+    whisper_model_size: str | None = None
+    whisper_cpu_threads: int | None = None
+    whisper_beam_size: int | None = None
     status: str
     stage: str | None = None
     progress: float | None = None

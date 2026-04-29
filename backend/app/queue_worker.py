@@ -12,9 +12,19 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    import psutil
+except ImportError:  # pragma: no cover - optional runtime dependency fallback
+    psutil = None
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - not available on Windows
+    resource = None
 from faster_whisper import WhisperModel
 
-from app.db import get_connection
+from app.db import get_connection, get_queue_stats
+from app.logging_utils import bind_log_context, log_event, reset_log_context
 from app.models import JobStage, JobStatus
 
 CONFIG_LOGGER = logging.getLogger("whisperio.worker.config")
@@ -25,12 +35,15 @@ def utc_now_iso() -> str:
 
 
 def _warn_config(name: str, value: object, default: object, reason: str) -> None:
-    CONFIG_LOGGER.warning(
-        "event=invalid_whisper_config name=%s raw_value=%s fallback=%s reason=%s",
-        name,
-        value,
-        default,
-        reason,
+    log_event(
+        CONFIG_LOGGER,
+        event="invalid_whisper_config",
+        level=logging.WARNING,
+        component="worker.config",
+        name=name,
+        raw_value=value,
+        fallback=default,
+        reason=reason,
     )
 
 
@@ -144,9 +157,8 @@ TAG_UNINTELLIGIBLE = "<Неразборчиво>"
 
 class TranscriptionWorker:
     def __init__(self) -> None:
-        self.queue: asyncio.Queue[str] = asyncio.Queue()
-        self._shutdown = asyncio.Event()
         self.logger = logging.getLogger("whisperio.worker")
+        self.current_request_id: str | None = None
         self.model_name = os.getenv("WHISPER_MODEL_SIZE", "medium")
         self.model_device = os.getenv("WHISPER_DEVICE", "cpu")
         self.model_compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
@@ -170,6 +182,12 @@ class TranscriptionWorker:
             getenv_int("WHISPER_BEAM_SIZE", 1),
             min_value=1,
             default=1,
+        )
+        self.best_of = ensure_config_min_int(
+            "WHISPER_BEST_OF",
+            getenv_int("WHISPER_BEST_OF", self.beam_size),
+            min_value=1,
+            default=max(1, self.beam_size),
         )
         self.temperature = clamp_config_float(
             "WHISPER_TEMPERATURE",
@@ -243,86 +261,14 @@ class TranscriptionWorker:
         self.tag_unintelligible_max_compression_ratio = getenv_float(
             "WHISPER_TAG_UNINTELLIGIBLE_MAX_COMPRESSION_RATIO", 2.4
         )
-
-    async def enqueue(self, job_id: str) -> None:
-        await self.queue.put(job_id)
-        self._log_event(
-            event="job_enqueued",
-            job_id=job_id,
-            stage=JobStage.QUEUED,
-            status=JobStatus.QUEUED,
-            progress=0.0,
-            queue_size=self.queue.qsize(),
+        self.sla_rtf_threshold = max(0.01, getenv_float("WHISPER_SLA_RTF_THRESHOLD", 0.25))
+        self.resource_snapshot_interval_sec = max(
+            1, getenv_int("LOG_SNAPSHOT_INTERVAL_SEC", 10)
         )
+        self._last_resource_snapshot_ts = 0.0
 
-    async def recover_pending_jobs(self) -> int:
-        with get_connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, status, stage, progress, status_message
-                FROM transcription_jobs
-                WHERE status IN (?, ?)
-                ORDER BY created_at ASC
-                """,
-                (JobStatus.QUEUED, JobStatus.PROCESSING),
-            ).fetchall()
-
-            if not rows:
-                return 0
-
-            job_ids = [row["id"] for row in rows]
-            now_label = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            for row in rows:
-                existing_message = (row["status_message"] or "").strip()
-                restored_message = (
-                    f"{existing_message}. Перезапуск сервиса, задача возвращена в очередь ({now_label})."
-                    if existing_message
-                    else f"Перезапуск сервиса, задача возвращена в очередь ({now_label})."
-                )
-                conn.execute(
-                    """
-                    UPDATE transcription_jobs
-                    SET status = ?, stage = COALESCE(stage, ?), progress = COALESCE(progress, ?),
-                        status_message = ?, started_at = NULL, finished_at = NULL,
-                        duration_sec = NULL, processing_duration_ms = NULL, transcribe_duration_ms = NULL,
-                        preprocess_duration_ms = NULL, prepared_audio_path = NULL, quality_flags = NULL,
-                        error = NULL, error_code = NULL
-                    WHERE id = ?
-                    """,
-                    (
-                        JobStatus.QUEUED,
-                        JobStage.QUEUED,
-                        0.0,
-                        restored_message,
-                        row["id"],
-                    ),
-                )
-
-        for job_id in job_ids:
-            await self.enqueue(job_id)
-
-        return len(job_ids)
-
-    async def run(self) -> None:
-        while not self._shutdown.is_set():
-            try:
-                job_id = await asyncio.wait_for(self.queue.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
-
-            self._log_event(
-                event="job_dequeued",
-                job_id=job_id,
-                stage=JobStage.PREPARING,
-                queue_size=self.queue.qsize(),
-            )
-            try:
-                await self._process_job(job_id)
-            finally:
-                self.queue.task_done()
-
-    async def shutdown(self) -> None:
-        self._shutdown.set()
+    def process_claimed_job(self, job_id: str) -> None:
+        asyncio.run(self._process_job(job_id))
 
     async def _get_model(self) -> WhisperModel:
         if self.model is not None:
@@ -375,6 +321,7 @@ class TranscriptionWorker:
             "language": self.language,
             "task": self.task,
             "beam_size": self.beam_size,
+            "best_of": self.best_of,
             "temperature": self.temperature,
             "vad_filter": self.vad_filter,
             "vad_parameters": vad_parameters,
@@ -386,6 +333,8 @@ class TranscriptionWorker:
         }
         if "chunk_length" in inspect.signature(model.transcribe).parameters:
             transcribe_kwargs["chunk_length"] = self.chunk_length_s
+        if "best_of" not in inspect.signature(model.transcribe).parameters:
+            transcribe_kwargs.pop("best_of", None)
         segments, info = model.transcribe(audio_path, **transcribe_kwargs)
         segment_rows = []
         for segment in segments:
@@ -700,10 +649,15 @@ class TranscriptionWorker:
         started_wall_time = time.perf_counter()
         prepared_audio_path: str | None = None
         preprocess_duration_ms: int | None = None
+        decorate_duration_ms: int | None = None
+        db_write_duration_ms: int | None = None
         quality_flags_json: str | None = None
+        request_id: str | None = None
+        audio_size_bytes: int | None = None
+        log_context_token = bind_log_context(worker_pid=os.getpid(), job_id=job_id)
         with get_connection() as conn:
             job = conn.execute(
-                "SELECT stored_path FROM transcription_jobs WHERE id = ?",
+                "SELECT stored_path, request_id FROM transcription_jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
             if not job:
@@ -713,7 +667,15 @@ class TranscriptionWorker:
                     stage=JobStage.FAILED,
                     error_code="JOB_NOT_FOUND",
                 )
+                reset_log_context(log_context_token)
                 return
+            request_id = job["request_id"]
+            reset_log_context(log_context_token)
+            log_context_token = bind_log_context(
+                worker_pid=os.getpid(),
+                job_id=job_id,
+                request_id=request_id,
+            )
 
             self._update_job(
                 conn=conn,
@@ -727,13 +689,25 @@ class TranscriptionWorker:
             )
 
         audio_path = job["stored_path"]
+        if Path(audio_path).exists():
+            audio_size_bytes = Path(audio_path).stat().st_size
         self._log_event(
             event="job_started",
             job_id=job_id,
             stage=JobStage.PREPARING,
             status=JobStatus.PROCESSING,
             progress=5.0,
+            extra_fields={
+                "request_id": request_id,
+                "audio_size_bytes": audio_size_bytes,
+                "decode_profile": "accuracy_first",
+                "beam_size": self.beam_size,
+                "best_of": self.best_of,
+                "chunk_length_s": self.chunk_length_s,
+                "vad_filter": self.vad_filter,
+            },
         )
+        self._log_resource_snapshot(job_id=job_id, stage=JobStage.PREPARING, force=True)
         try:
             with get_connection() as conn:
                 self._update_job(
@@ -746,11 +720,12 @@ class TranscriptionWorker:
                 )
             preprocess_started = time.perf_counter()
             self._log_event(
-                event="preprocess_started",
+                event="stage_started",
                 job_id=job_id,
                 stage=JobStage.PREPROCESSING,
                 status=JobStatus.PROCESSING,
                 progress=10.0,
+                extra_fields={"stage_name": "preprocess"},
             )
             prepared_audio_path = await asyncio.to_thread(self._prepare_audio, audio_path)
             preprocess_duration_ms = int((time.perf_counter() - preprocess_started) * 1000)
@@ -766,13 +741,18 @@ class TranscriptionWorker:
                     prepared_audio_path=prepared_audio_path if self.keep_prepared_audio else None,
                 )
             self._log_event(
-                event="preprocess_finished",
+                event="stage_finished",
                 job_id=job_id,
                 stage=JobStage.PREPROCESSING,
                 status=JobStatus.PROCESSING,
                 progress=14.0,
                 duration_ms=preprocess_duration_ms,
-                extra_fields={"prepared_audio_path": prepared_audio_path},
+                extra_fields={
+                    "stage_name": "preprocess",
+                    "prepared_audio_file": (
+                        Path(prepared_audio_path).name if prepared_audio_path else None
+                    ),
+                },
             )
 
             with get_connection() as conn:
@@ -787,11 +767,12 @@ class TranscriptionWorker:
             model = await self._get_model()
             transcribe_started = time.perf_counter()
             self._log_event(
-                event="transcribe_started",
+                event="stage_started",
                 job_id=job_id,
                 stage=JobStage.TRANSCRIBING,
                 status=JobStatus.PROCESSING,
                 progress=20.0,
+                extra_fields={"stage_name": "transcribe"},
             )
             primary_rows, info = await self._run_transcribe(
                 model,
@@ -851,12 +832,14 @@ class TranscriptionWorker:
                 )
 
             transcribe_duration_ms = int((time.perf_counter() - transcribe_started) * 1000)
+            decorate_started = time.perf_counter()
             decorated_rows, tagging_stats = await asyncio.to_thread(
                 self._decorate_segments,
                 raw_segment_rows,
                 prepared_audio_path or audio_path,
                 float(info.duration or 0.0),
             )
+            decorate_duration_ms = int((time.perf_counter() - decorate_started) * 1000)
             quality_payload["tagging"] = tagging_stats
             quality_flags_json = json.dumps(quality_payload, ensure_ascii=False)
             segment_rows = [
@@ -877,7 +860,7 @@ class TranscriptionWorker:
                     quality_flags=quality_flags_json,
                 )
             self._log_event(
-                event="transcribe_finished",
+                event="stage_finished",
                 job_id=job_id,
                 stage=JobStage.TRANSCRIBING,
                 status=JobStatus.PROCESSING,
@@ -886,8 +869,10 @@ class TranscriptionWorker:
                 segment_count=len(segment_rows),
                 audio_duration_sec=float(info.duration or 0.0),
                 extra_fields={
+                    "stage_name": "transcribe",
                     "fallback_used": fallback_used,
                     "preprocess_duration_ms": preprocess_duration_ms,
+                    "decorate_duration_ms": decorate_duration_ms,
                     "tag_silence_count": tagging_stats["inserted_tags"][TAG_SILENCE],
                     "tag_music_count": tagging_stats["inserted_tags"][TAG_MUSIC],
                     "tag_unintelligible_count": tagging_stats["inserted_tags"][TAG_UNINTELLIGIBLE],
@@ -927,6 +912,14 @@ class TranscriptionWorker:
                     clear_error=True,
                 )
             persist_duration_ms = int((time.perf_counter() - persist_started) * 1000)
+            db_write_duration_ms = persist_duration_ms
+            rtf = None
+            effective_speed_x = None
+            audio_duration_sec = float(info.duration or 0.0)
+            if audio_duration_sec > 0:
+                processing_sec = wall_duration_ms / 1000.0
+                rtf = round(processing_sec / audio_duration_sec, 6)
+                effective_speed_x = round(audio_duration_sec / max(processing_sec, 1e-6), 6)
             self._log_event(
                 event="job_completed",
                 job_id=job_id,
@@ -936,10 +929,35 @@ class TranscriptionWorker:
                 duration_ms=wall_duration_ms,
                 persist_duration_ms=persist_duration_ms,
                 segment_count=len(segment_rows),
-                extra_fields={"preprocess_duration_ms": preprocess_duration_ms},
+                extra_fields={
+                    "preprocess_duration_ms": preprocess_duration_ms,
+                    "transcribe_duration_ms": transcribe_duration_ms,
+                    "decorate_duration_ms": decorate_duration_ms,
+                    "db_write_duration_ms": db_write_duration_ms,
+                    "total_duration_ms": wall_duration_ms,
+                    "audio_duration_sec": audio_duration_sec,
+                    "rtf": rtf,
+                    "effective_speed_x": effective_speed_x,
+                },
+            )
+            self._emit_sla_event_if_needed(
+                rtf=rtf,
+                job_id=job_id,
+                stage=JobStage.COMPLETED,
+                fallback_used=fallback_used,
             )
         except Exception as exc:  # noqa: BLE001
             wall_duration_ms = int((time.perf_counter() - started_wall_time) * 1000)
+            self._log_event(
+                event="stage_failed",
+                job_id=job_id,
+                stage=JobStage.FAILED,
+                status=JobStatus.FAILED,
+                progress=100.0,
+                error_code=self._infer_error_code(exc),
+                error_message=self._safe_error_message(exc),
+                extra_fields={"failed_stage": "pipeline"},
+            )
             with get_connection() as conn:
                 status_message = "Ошибка обработки"
                 if isinstance(exc, AudioPreprocessError):
@@ -969,11 +987,13 @@ class TranscriptionWorker:
                 progress=100.0,
                 duration_ms=wall_duration_ms,
                 error_code=self._infer_error_code(exc),
-                error_message=str(exc),
+                error_message=self._safe_error_message(exc),
                 extra_fields={"preprocess_duration_ms": preprocess_duration_ms},
             )
         finally:
             self._cleanup_prepared_audio(prepared_audio_path)
+            self._log_resource_snapshot(job_id=job_id, stage=JobStage.COMPLETED, force=True)
+            reset_log_context(log_context_token)
 
     def _update_job(
         self,
@@ -1048,6 +1068,92 @@ class TranscriptionWorker:
             return "DB_WRITE_FAILED"
         return "TRANSCRIPTION_FAILED"
 
+    def _safe_error_message(self, exc: Exception) -> str:
+        if isinstance(exc, AudioPreprocessError):
+            return "Audio preprocessing failed"
+        if isinstance(exc, QualityGuardError):
+            return "Quality guard failed"
+        return type(exc).__name__
+
+    def _emit_sla_event_if_needed(
+        self,
+        *,
+        rtf: float | None,
+        job_id: str,
+        stage: JobStage,
+        fallback_used: bool,
+    ) -> None:
+        if rtf is None:
+            return
+        if rtf > self.sla_rtf_threshold:
+            reason_code = "decode_slowdown"
+            queue_stats = get_queue_stats()
+            if queue_stats["queued"] > 0:
+                reason_code = "cpu_saturation"
+            if fallback_used:
+                reason_code = "audio_complexity_high"
+            self._log_event(
+                event="sla_drift_detected",
+                job_id=job_id,
+                stage=stage,
+                status=JobStatus.DONE,
+                extra_fields={
+                    "reason_code": reason_code,
+                    "rtf": rtf,
+                    "rtf_threshold": self.sla_rtf_threshold,
+                    "queue_backlog": queue_stats["queued"],
+                    "processing_jobs": queue_stats["processing"],
+                    "fallback_used": fallback_used,
+                },
+            )
+
+    def _log_resource_snapshot(self, *, job_id: str, stage: JobStage, force: bool = False) -> None:
+        if psutil is None:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_resource_snapshot_ts) < self.resource_snapshot_interval_sec:
+            return
+        self._last_resource_snapshot_ts = now
+        process = psutil.Process(os.getpid())
+        mem = process.memory_info()
+        cpu_percent = process.cpu_percent(interval=None)
+        num_threads = process.num_threads()
+        open_files_count = len(process.open_files())
+        ctx_switches = process.num_ctx_switches()
+        max_rss_kb = None
+        if resource is not None:
+            ru = resource.getrusage(resource.RUSAGE_SELF)
+            max_rss_kb = int(getattr(ru, "ru_maxrss", 0))
+        self._log_event(
+            event="worker_resource_snapshot",
+            job_id=job_id,
+            stage=stage,
+            extra_fields={
+                "worker_pid": os.getpid(),
+                "cpu_percent": cpu_percent,
+                "rss_bytes": mem.rss,
+                "vms_bytes": mem.vms,
+                "threads": num_threads,
+                "open_files_count": open_files_count,
+                "ctx_switches_voluntary": ctx_switches.voluntary,
+                "ctx_switches_involuntary": ctx_switches.involuntary,
+                "max_rss_kb": max_rss_kb,
+            },
+        )
+        high_watermark_mb = getenv_int("LOG_RESOURCE_RSS_WARN_MB", 12288)
+        if mem.rss > high_watermark_mb * 1024 * 1024:
+            self._log_event(
+                event="resource_pressure_warning",
+                job_id=job_id,
+                stage=stage,
+                status=JobStatus.PROCESSING,
+                extra_fields={
+                    "reason_code": "rss_high_watermark",
+                    "rss_bytes": mem.rss,
+                    "rss_warn_mb": high_watermark_mb,
+                },
+            )
+
     def _log_event(
         self,
         *,
@@ -1081,9 +1187,13 @@ class TranscriptionWorker:
         }
         if extra_fields:
             payload.update(extra_fields)
-        formatted = " ".join(
-            f"{key}={value}"
-            for key, value in payload.items()
-            if value is not None
+        clean_payload = {
+            key: value for key, value in payload.items() if value is not None
+        }
+        clean_payload.pop("event", None)
+        log_event(
+            self.logger,
+            event=event,
+            component="worker.pipeline",
+            **clean_payload,
         )
-        self.logger.info(formatted)

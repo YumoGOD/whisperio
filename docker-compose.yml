@@ -7,15 +7,15 @@ services:
       - "8000:8000"
     environment:
       # ==== Model / hardware ====
-      # Модель Whisper: medium = заметно быстрее на CPU, но ниже точность чем large-v3.
-      WHISPER_MODEL_SIZE: medium
+      # Accuracy-first профиль для CPU-only: large-v3 + int8.
+      WHISPER_MODEL_SIZE: large-v3
       # Устройство: cpu (для вашего сервера без GPU).
       WHISPER_DEVICE: cpu
       # Тип вычислений: int8 ускоряет и снижает RAM, с небольшой потерей точности.
       WHISPER_COMPUTE_TYPE: int8
-      # Потоки на один инференс модели.
-      WHISPER_CPU_THREADS: "8"
-      # Внутренние workers CTranslate2.
+      # Потоки CTranslate2 на один worker-процесс.
+      WHISPER_CPU_THREADS: "12"
+      # Внутренние workers CTranslate2 внутри процесса (обычно 1 для CPU).
       WHISPER_MODEL_WORKERS: "1"
 
       # ==== Language / task ====
@@ -24,8 +24,9 @@ services:
       WHISPER_TASK: transcribe
 
       # ==== Decode quality/speed ====
-      # Beam/best_of: выше = точнее, но сильно медленнее.
-      WHISPER_BEAM_SIZE: 1
+      # Beam/best_of: стартовый accuracy-first профиль в рамках SLA.
+      WHISPER_BEAM_SIZE: 2
+      WHISPER_BEST_OF: 1
       # Температура 0.0 даёт максимально детерминированный результат.
       WHISPER_TEMPERATURE: 0.0
       # Начальный промпт (если не нужен — пустая строка).
@@ -37,21 +38,19 @@ services:
       # VAD отрезает неречевые участки до декодирования: ускоряет и уменьшает шум.
       WHISPER_VAD_FILTER: "true"
       # Порог VAD: выше = строже, может потерять тихую речь; ниже = больше фонового шума.
-      WHISPER_VAD_THRESHOLD: "0.6"
+      WHISPER_VAD_THRESHOLD: "0.5"
       # Минимальная тишина для разрыва речи (мс): меньше = больше сегментов.
-      WHISPER_VAD_MIN_SILENCE_DURATION_MS: "700"
+      WHISPER_VAD_MIN_SILENCE_DURATION_MS: "500"
       # Дополнительный запас вокруг речи (мс): выше = меньше обрезаний концов слов.
-      WHISPER_VAD_SPEECH_PAD_MS: "300"
+      WHISPER_VAD_SPEECH_PAD_MS: "400"
       # Пороги декодера: влияют на отбраковку низкокачественных сегментов.
-      WHISPER_NO_SPEECH_THRESHOLD: "0.45"
+      WHISPER_NO_SPEECH_THRESHOLD: "0.4"
       WHISPER_LOG_PROB_THRESHOLD: "-1.0"
       WHISPER_COMPRESSION_RATIO_THRESHOLD: "2.4"
 
       # ==== Tags: <Тишина> / <Музыка> / <Неразборчиво> ====
-      # Общий выключатель спец-тегов: false = не вставлять служебные метки.
-      WHISPER_ENABLE_TAGS: "false"
       # Минимальная пауза (сек) для тега <Тишина>.
-      WHISPER_TAG_SILENCE_MIN_SEC: "3.0"
+      WHISPER_TAG_SILENCE_MIN_SEC: "5.0"
       # dBFS-порог тишины: ниже (например -42) = чаще <Тишина>; выше = реже.
       WHISPER_TAG_SILENCE_DBFS: "-38.0"
       # Минимальная длина интервала для классификации как музыка.
@@ -60,15 +59,15 @@ services:
       WHISPER_TAG_MUSIC_MAX_ZCR: "0.08"
       WHISPER_TAG_MUSIC_MAX_ENERGY_VARIATION: "0.35"
       # Пороги для <Неразборчиво>: ужесточение => больше таких меток.
-      WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOGPROB: "-1.25"
-      WHISPER_TAG_UNINTELLIGIBLE_MIN_NO_SPEECH_PROB: "0.60"
+      WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOGPROB: "-1.15"
+      WHISPER_TAG_UNINTELLIGIBLE_MIN_NO_SPEECH_PROB: "0.55"
       WHISPER_TAG_UNINTELLIGIBLE_MAX_COMPRESSION_RATIO: "2.4"
 
       # ==== Quality guard ====
       # Повторный прогон при аномалиях (может улучшить качество, но увеличивает время).
       WHISPER_ENABLE_QUALITY_FALLBACK: "false"
-      WHISPER_MIN_UNIQUE_SEGMENT_RATIO: "0.25"
-      WHISPER_MAX_TOP_REPEAT_RATIO: "0.7"
+      WHISPER_MIN_UNIQUE_SEGMENT_RATIO: "0.15"
+      WHISPER_MAX_TOP_REPEAT_RATIO: "0.8"
       WHISPER_MAX_PROMPT_MATCH_RATIO: "0.5"
 
       # ==== Preprocess / runtime ====
@@ -76,17 +75,35 @@ services:
       WHISPER_PREPROCESS_SAMPLE_RATE: "16000"
       # Таймаут ffmpeg на подготовку.
       WHISPER_PREPROCESS_TIMEOUT_SEC: "1800"
-      WHISPER_CHUNK_LENGTH_S: "20"
       # Для дебага можно оставить prepared wav.
       WHISPER_KEEP_PREPARED_AUDIO: "false"
+      # Длина чанка для поддерживаемых версий faster-whisper.
+      WHISPER_CHUNK_LENGTH_S: "30"
 
       # ==== Parallelism ====
-      # Очередь: несколько async-воркеров могут параллелить этапы пайплайна.
-      # Вызовы transcribe сериализуются для shared-модели (безопасный режим).
-      WHISPER_WORKERS: "4"
-      # Глобальные лимиты потоков math-библиотек.
-      OMP_NUM_THREADS: "12"
-      MKL_NUM_THREADS: "12"
+      # Количество отдельных worker-процессов с собственной моделью.
+      WHISPER_WORKER_PROCESSES: "1"
+      # Интервал опроса БД для диспетчера.
+      WHISPER_DISPATCH_POLL_MS: "300"
+      # Потоки math-библиотек (согласованы с WHISPER_CPU_THREADS).
+      OMP_NUM_THREADS: "15"
+      MKL_NUM_THREADS: "15"
+      # Принудительная настройка потоков внутри subprocess-воркеров.
+      WHISPER_PROCESS_OMP_THREADS: "12"
+      WHISPER_PROCESS_MKL_THREADS: "12"
+      # Таймаут конкурентного доступа к SQLite.
+      SQLITE_BUSY_TIMEOUT_MS: "30000"
+      # ==== Logging / observability ====
+      LOG_FORMAT: json
+      LOG_LEVEL: INFO
+      LOG_SERVICE_NAME: whisperio-backend
+      LOG_FILE_ENABLED: "true"
+      LOG_FILE_PATH: /app/data/logs/backend.jsonl
+      LOG_FILE_MAX_BYTES: "52428800"
+      LOG_FILE_BACKUP_COUNT: "5"
+      LOG_SNAPSHOT_INTERVAL_SEC: "10"
+      LOG_RESOURCE_RSS_WARN_MB: "12288"
+      WHISPER_SLA_RTF_THRESHOLD: "0.25"
 
       # ==== Paths ====
       HF_HOME: /app/data/huggingface
@@ -94,6 +111,11 @@ services:
       UPLOAD_DIR: /app/data/uploads
     volumes:
       - ./data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
     restart: unless-stopped
 
   frontend:

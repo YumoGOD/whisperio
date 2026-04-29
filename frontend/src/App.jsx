@@ -76,6 +76,15 @@ function formatDurationMs(value) {
   return hrs > 0 ? `${hrs}:${min}:${sec}` : `${min}:${sec}`;
 }
 
+function formatWhisperSettings(job) {
+  const model = job?.whisper_model_size || "n/a";
+  const cpuThreads =
+    typeof job?.whisper_cpu_threads === "number" ? job.whisper_cpu_threads : "n/a";
+  const beamSize =
+    typeof job?.whisper_beam_size === "number" ? job.whisper_beam_size : "n/a";
+  return `Model: ${model} | CPU_THREADS: ${cpuThreads} | BEAM_SIZE: ${beamSize}`;
+}
+
 function getStatusClass(status) {
   if (status === "done") {
     return "is-success";
@@ -356,6 +365,7 @@ function App() {
                     </div>
                   )}
                   <span className="meta">Создано: {formatDateTime(job.created_at)}</span>
+                  <span className="meta">{formatWhisperSettings(job)}</span>
                 </button>
               </li>
             ))}
@@ -392,6 +402,9 @@ function App() {
                   <strong>Детали:</strong> {selectedJob.status_message}
                 </p>
               )}
+              <p>
+                <strong>Настройки:</strong> {formatWhisperSettings(selectedJob)}
+              </p>
               {selectedJob.error && (
                 <p className="inline-message is-danger">
                   <strong>Ошибка:</strong> {selectedJob.error}

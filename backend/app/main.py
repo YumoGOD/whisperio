@@ -1,7 +1,7 @@
-import asyncio
 import logging
 import mimetypes
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -12,9 +12,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-from app.db import get_connection, init_db
+from app.db import get_connection, init_db, requeue_unfinished_jobs
+from app.logging_utils import bind_log_context, configure_logging, log_event, reset_log_context
 from app.models import JobStage, JobStatus
-from app.queue_worker import TranscriptionWorker, utc_now_iso
+from app.queue_worker import utc_now_iso
+from app.runtime import TranscriptionRuntime
 from app.schemas import ErrorResponse, JobCreateResponse, JobDetail, JobListItem
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/uploads"))
@@ -42,58 +44,42 @@ AUDIO_MEDIA_TYPES = {
     ".webm": "audio/webm",
 }
 
-worker = TranscriptionWorker()
-worker_tasks: list[asyncio.Task[None]] = []
-
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
-logger = logging.getLogger("whisperio.api")
+DEFAULT_WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "medium")
 
 
-def resolve_worker_count() -> int:
-    raw = os.getenv("WHISPER_WORKERS", "1").strip()
+def env_int(name: str, default: int) -> int:
     try:
-        parsed = int(raw)
+        return int(os.getenv(name, str(default)))
     except ValueError:
-        logger.warning("event=invalid_worker_count raw_value=%s fallback=1", raw)
-        return 1
-    if parsed < 1:
-        logger.warning("event=invalid_worker_count raw_value=%s fallback=1", raw)
-        return 1
-    return parsed
+        return default
+
+
+DEFAULT_WHISPER_CPU_THREADS = max(1, env_int("WHISPER_CPU_THREADS", 12))
+DEFAULT_WHISPER_BEAM_SIZE = max(1, env_int("WHISPER_BEAM_SIZE", 1))
+
+runtime = TranscriptionRuntime()
+
+configure_logging()
+logger = logging.getLogger("whisperio.api")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global worker_tasks
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     init_db()
-    recovered_jobs = await worker.recover_pending_jobs()
+    recovered_jobs = requeue_unfinished_jobs()
     if recovered_jobs:
-        logger.info("event=pending_jobs_recovered count=%s", recovered_jobs)
-    worker_count = resolve_worker_count()
-    worker_tasks = [
-        asyncio.create_task(worker.run(), name=f"transcription-worker-{idx + 1}")
-        for idx in range(worker_count)
-    ]
-    logger.info("event=workers_started count=%s", worker_count)
-    if worker_count > 1:
-        logger.info(
-            "event=transcribe_calls_serialized reason=shared_whisper_model count=%s",
-            worker_count,
+        log_event(
+            logger,
+            event="pending_jobs_recovered",
+            component="api.lifecycle",
+            count=recovered_jobs,
         )
+    await runtime.start()
     try:
         yield
     finally:
-        await worker.shutdown()
-        for task in worker_tasks:
-            task.cancel()
-        if worker_tasks:
-            await asyncio.gather(*worker_tasks, return_exceptions=True)
-        logger.info("event=workers_stopped count=%s", len(worker_tasks))
-        worker_tasks = []
+        await runtime.stop()
 
 
 app = FastAPI(title="WhisperIO API", lifespan=lifespan)
@@ -105,6 +91,55 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid4())
+    request.state.request_id = request_id
+    token = bind_log_context(request_id=request_id)
+    started = time.perf_counter()
+    log_event(
+        logger,
+        event="api_request_started",
+        component="api.http",
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        client_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        log_event(
+            logger,
+            event="api_request_finished",
+            level=logging.ERROR,
+            component="api.http",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            status_code=500,
+            duration_ms=duration_ms,
+        )
+        reset_log_context(token)
+        raise
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    response.headers["X-Request-ID"] = request_id
+    log_event(
+        logger,
+        event="api_request_finished",
+        component="api.http",
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        duration_ms=duration_ms,
+    )
+    reset_log_context(token)
+    return response
 
 
 def _extract_error_message(detail: object) -> str:
@@ -153,7 +188,7 @@ def _build_error_payload(
 
 
 @app.exception_handler(HTTPException)
-async def handle_http_exception(_: Request, exc: HTTPException):
+async def handle_http_exception(request: Request, exc: HTTPException):
     code = "HTTP_ERROR"
     if isinstance(exc.detail, dict) and exc.detail.get("code"):
         code = str(exc.detail["code"])
@@ -163,23 +198,56 @@ async def handle_http_exception(_: Request, exc: HTTPException):
         code = "BAD_REQUEST"
     elif exc.status_code == 413:
         code = "PAYLOAD_TOO_LARGE"
+    log_event(
+        logger,
+        event="http_exception",
+        level=logging.WARNING if exc.status_code < 500 else logging.ERROR,
+        component="api.http",
+        request_id=getattr(request.state, "request_id", None),
+        method=request.method,
+        path=request.url.path,
+        status_code=exc.status_code,
+        error_code=code,
+    )
     payload = _build_error_payload(code=code, detail=exc.detail, fallback_message="Ошибка запроса")
     return JSONResponse(status_code=exc.status_code, content=payload)
 
 
 @app.exception_handler(RequestValidationError)
-async def handle_validation_exception(_: Request, exc: RequestValidationError):
+async def handle_validation_exception(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    log_event(
+        logger,
+        event="request_validation_failed",
+        level=logging.WARNING,
+        component="api.http",
+        request_id=getattr(request.state, "request_id", None),
+        method=request.method,
+        path=request.url.path,
+        status_code=422,
+        validation_errors_count=len(errors),
+    )
     payload = {
         "code": "VALIDATION_ERROR",
         "message": "Ошибка валидации запроса",
-        "details": exc.errors(),
+        "details": errors,
     }
     return JSONResponse(status_code=422, content=payload)
 
 
 @app.exception_handler(Exception)
-async def handle_unexpected_exception(_: Request, exc: Exception):  # noqa: BLE001
-    logger.exception("event=unhandled_exception error=%s", str(exc))
+async def handle_unexpected_exception(request: Request, exc: Exception):  # noqa: BLE001
+    log_event(
+        logger,
+        event="unhandled_exception",
+        level=logging.ERROR,
+        component="api.http",
+        request_id=getattr(request.state, "request_id", None),
+        method=request.method,
+        path=request.url.path,
+        error_type=type(exc).__name__,
+        error_message=str(exc),
+    )
     payload = {
         "code": "INTERNAL_SERVER_ERROR",
         "message": "Внутренняя ошибка сервера",
@@ -195,12 +263,18 @@ def parse_dt(value: str | None) -> datetime | None:
 
 
 @app.get("/health")
-def health():
+def health(request: Request):
+    log_event(
+        logger,
+        event="health_check_ok",
+        component="api.health",
+        request_id=getattr(request.state, "request_id", None),
+    )
     return {"status": "ok"}
 
 
 @app.post("/api/jobs", response_model=JobCreateResponse, responses={400: {"model": ErrorResponse}})
-async def create_job(file: UploadFile = File(...)):
+async def create_job(request: Request, file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(
             status_code=400,
@@ -208,6 +282,7 @@ async def create_job(file: UploadFile = File(...)):
         )
 
     job_id = str(uuid4())
+    request_id = getattr(request.state, "request_id", None)
     suffix = Path(file.filename).suffix.lower()
     if suffix and suffix not in ALLOWED_AUDIO_EXTENSIONS:
         raise HTTPException(
@@ -231,6 +306,7 @@ async def create_job(file: UploadFile = File(...)):
     stored_path = UPLOAD_DIR / stored_name
     total_size = 0
     has_content = False
+    upload_started = time.perf_counter()
     try:
         with stored_path.open("wb") as destination:
             while True:
@@ -261,17 +337,18 @@ async def create_job(file: UploadFile = File(...)):
         await file.close()
 
     created_at = utc_now_iso()
-
     with get_connection() as conn:
         conn.execute(
             """
             INSERT INTO transcription_jobs (
-                id, original_filename, stored_path, status, stage, progress,
-                status_message, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                id, request_id, original_filename, stored_path, status, stage, progress,
+                status_message, created_at, whisper_model_size, whisper_cpu_threads,
+                whisper_beam_size
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
+                request_id,
                 file.filename,
                 str(stored_path),
                 JobStatus.QUEUED,
@@ -279,40 +356,62 @@ async def create_job(file: UploadFile = File(...)):
                 0.0,
                 "Ожидает обработки",
                 created_at,
+                DEFAULT_WHISPER_MODEL_SIZE,
+                DEFAULT_WHISPER_CPU_THREADS,
+                DEFAULT_WHISPER_BEAM_SIZE,
             ),
         )
 
-    await worker.enqueue(job_id)
-    logger.info("event=job_created job_id=%s status=%s stage=%s", job_id, JobStatus.QUEUED, JobStage.QUEUED)
+    upload_duration_ms = int((time.perf_counter() - upload_started) * 1000)
+    log_event(
+        logger,
+        event="job_created",
+        component="api.jobs",
+        job_id=job_id,
+        request_id=request_id,
+        status=JobStatus.QUEUED,
+        stage=JobStage.QUEUED,
+        upload_duration_ms=upload_duration_ms,
+        upload_size_bytes=total_size,
+        file_extension=suffix or None,
+    )
     return {"job_id": job_id, "status": JobStatus.QUEUED}
 
 
 @app.get("/api/jobs", response_model=list[JobListItem])
-def list_jobs():
+def list_jobs(request: Request):
     with get_connection() as conn:
         rows = conn.execute(
             """
             SELECT id, original_filename, status, stage, progress, status_message,
                    error, error_code, created_at, started_at, finished_at, duration_sec,
                    processing_duration_ms, transcribe_duration_ms, preprocess_duration_ms,
-                   prepared_audio_path, quality_flags
+                   prepared_audio_path, quality_flags, whisper_model_size,
+                   whisper_cpu_threads, whisper_beam_size
             FROM transcription_jobs
             ORDER BY created_at DESC
             """
         ).fetchall()
-
+    log_event(
+        logger,
+        event="jobs_listed",
+        component="api.jobs",
+        request_id=getattr(request.state, "request_id", None),
+        jobs_count=len(rows),
+    )
     return [serialize_job_row(row) for row in rows]
 
 
 @app.get("/api/jobs/{job_id}", response_model=JobDetail, responses={404: {"model": ErrorResponse}})
-def get_job(job_id: str):
+def get_job(job_id: str, request: Request):
     with get_connection() as conn:
         row = conn.execute(
             """
             SELECT id, original_filename, status, stage, progress, status_message,
                    error, error_code, created_at, started_at, finished_at, duration_sec,
                    processing_duration_ms, transcribe_duration_ms, preprocess_duration_ms,
-                   prepared_audio_path, quality_flags, stored_path
+                   prepared_audio_path, quality_flags, whisper_model_size,
+                   whisper_cpu_threads, whisper_beam_size, stored_path
             FROM transcription_jobs
             WHERE id = ?
             """,
@@ -320,6 +419,14 @@ def get_job(job_id: str):
         ).fetchone()
 
         if not row:
+            log_event(
+                logger,
+                event="job_detail_not_found",
+                level=logging.WARNING,
+                component="api.jobs",
+                request_id=getattr(request.state, "request_id", None),
+                job_id=job_id,
+            )
             raise HTTPException(
                 status_code=404,
                 detail={"code": "JOB_NOT_FOUND", "message": "Задача не найдена"},
@@ -345,11 +452,21 @@ def get_job(job_id: str):
         }
         for seg in segments
     ]
+    log_event(
+        logger,
+        event="job_detail_fetched",
+        component="api.jobs",
+        request_id=getattr(request.state, "request_id", None),
+        job_id=job_id,
+        segment_count=len(segments),
+        status=payload.get("status"),
+        stage=payload.get("stage"),
+    )
     return payload
 
 
 @app.get("/api/jobs/{job_id}/audio", responses={404: {"model": ErrorResponse}})
-def get_job_audio(job_id: str):
+def get_job_audio(job_id: str, request: Request):
     with get_connection() as conn:
         row = conn.execute(
             """
@@ -360,6 +477,15 @@ def get_job_audio(job_id: str):
             (job_id,),
         ).fetchone()
     if not row:
+        log_event(
+            logger,
+            event="job_audio_not_found",
+            level=logging.WARNING,
+            component="api.jobs",
+            request_id=getattr(request.state, "request_id", None),
+            job_id=job_id,
+            reason_code="job_not_found",
+        )
         raise HTTPException(
             status_code=404,
             detail={"code": "JOB_NOT_FOUND", "message": "Задача не найдена"},
@@ -367,6 +493,15 @@ def get_job_audio(job_id: str):
 
     audio_path = Path(row["stored_path"])
     if not audio_path.exists() or not audio_path.is_file():
+        log_event(
+            logger,
+            event="job_audio_not_found",
+            level=logging.WARNING,
+            component="api.jobs",
+            request_id=getattr(request.state, "request_id", None),
+            job_id=job_id,
+            reason_code="audio_file_missing",
+        )
         raise HTTPException(
             status_code=404,
             detail={"code": "AUDIO_FILE_NOT_FOUND", "message": "Аудиофайл задачи не найден"},
@@ -375,6 +510,15 @@ def get_job_audio(job_id: str):
     media_type, _ = mimetypes.guess_type(str(audio_path))
     if not media_type:
         media_type = AUDIO_MEDIA_TYPES.get(audio_path.suffix.lower())
+    log_event(
+        logger,
+        event="job_audio_served",
+        component="api.jobs",
+        request_id=getattr(request.state, "request_id", None),
+        job_id=job_id,
+        media_type=media_type or "application/octet-stream",
+        filename=row["original_filename"] or audio_path.name,
+    )
     return FileResponse(
         path=audio_path,
         media_type=media_type or "application/octet-stream",
@@ -386,6 +530,9 @@ def serialize_job_row(row) -> dict:
     return {
         "id": row["id"],
         "original_filename": row["original_filename"],
+        "whisper_model_size": row["whisper_model_size"],
+        "whisper_cpu_threads": row["whisper_cpu_threads"],
+        "whisper_beam_size": row["whisper_beam_size"],
         "status": row["status"],
         "stage": row["stage"],
         "progress": row["progress"],
