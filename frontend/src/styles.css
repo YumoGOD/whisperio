@@ -282,6 +282,16 @@ button:disabled {
   margin-top: 0.4rem;
 }
 
+.result-actions {
+  margin-top: 0.8rem;
+}
+
+.secondary-button {
+  background: var(--surface-soft);
+  color: var(--text-main);
+  border-color: var(--border);
+}
+
 .audio-player {
   width: 100%;
   margin-top: 0.8rem;

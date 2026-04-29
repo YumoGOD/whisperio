@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import logging
 import math
@@ -70,32 +71,33 @@ class TranscriptionWorker:
         self.model_name = os.getenv("WHISPER_MODEL_SIZE", "medium")
         self.model_device = os.getenv("WHISPER_DEVICE", "cpu")
         self.model_compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
-        self.model_cpu_threads = max(1, getenv_int("WHISPER_CPU_THREADS", 4))
-        self.model_workers = max(1, getenv_int("WHISPER_MODEL_WORKERS", 1))
+        self.model_cpu_threads = max(1, getenv_int("WHISPER_CPU_THREADS", 12))
+        self.model_workers = max(1, getenv_int("WHISPER_MODEL_WORKERS", 4))
         self.model: WhisperModel | None = None
         self._model_lock = asyncio.Lock()
         self.language = os.getenv("WHISPER_LANGUAGE", "ru")
         self.task = os.getenv("WHISPER_TASK", "transcribe")
-        self.beam_size = getenv_int("WHISPER_BEAM_SIZE", 3)
-        self.best_of = getenv_int("WHISPER_BEST_OF", 3)
+        self.beam_size = getenv_int("WHISPER_BEAM_SIZE", 1)
+        self.best_of = getenv_int("WHISPER_BEST_OF", 1)
         self.temperature = getenv_float("WHISPER_TEMPERATURE", 0.0)
         self.initial_prompt = os.getenv("WHISPER_INITIAL_PROMPT", "").strip() or None
-        self.condition_on_previous_text = getenv_bool("WHISPER_CONDITION_ON_PREVIOUS_TEXT", False)
+        self.condition_on_previous_text = getenv_bool("WHISPER_CONDITION_ON_PREVIOUS_TEXT", True)
         self.vad_filter = getenv_bool("WHISPER_VAD_FILTER", True)
-        self.vad_threshold = getenv_float("WHISPER_VAD_THRESHOLD", 0.5)
-        self.vad_min_silence_duration_ms = getenv_int("WHISPER_VAD_MIN_SILENCE_DURATION_MS", 500)
-        self.vad_speech_pad_ms = getenv_int("WHISPER_VAD_SPEECH_PAD_MS", 400)
-        self.no_speech_threshold = getenv_float("WHISPER_NO_SPEECH_THRESHOLD", 0.4)
+        self.vad_threshold = getenv_float("WHISPER_VAD_THRESHOLD", 0.6)
+        self.vad_min_silence_duration_ms = getenv_int("WHISPER_VAD_MIN_SILENCE_DURATION_MS", 700)
+        self.vad_speech_pad_ms = getenv_int("WHISPER_VAD_SPEECH_PAD_MS", 300)
+        self.no_speech_threshold = getenv_float("WHISPER_NO_SPEECH_THRESHOLD", 0.45)
         self.log_prob_threshold = getenv_float("WHISPER_LOG_PROB_THRESHOLD", -1.0)
         self.compression_ratio_threshold = getenv_float("WHISPER_COMPRESSION_RATIO_THRESHOLD", 2.4)
         self.enable_quality_fallback = getenv_bool("WHISPER_ENABLE_QUALITY_FALLBACK", True)
-        self.min_unique_ratio = getenv_float("WHISPER_MIN_UNIQUE_SEGMENT_RATIO", 0.15)
-        self.max_top_repeat_ratio = getenv_float("WHISPER_MAX_TOP_REPEAT_RATIO", 0.8)
+        self.min_unique_ratio = getenv_float("WHISPER_MIN_UNIQUE_SEGMENT_RATIO", 0.25)
+        self.max_top_repeat_ratio = getenv_float("WHISPER_MAX_TOP_REPEAT_RATIO", 0.7)
         self.max_prompt_match_ratio = getenv_float("WHISPER_MAX_PROMPT_MATCH_RATIO", 0.5)
         self.preprocess_sample_rate = getenv_int("WHISPER_PREPROCESS_SAMPLE_RATE", 16000)
         self.preprocess_timeout_sec = getenv_int("WHISPER_PREPROCESS_TIMEOUT_SEC", 1800)
+        self.chunk_length_s = max(1, getenv_int("WHISPER_CHUNK_LENGTH_S", 20))
         self.keep_prepared_audio = getenv_bool("WHISPER_KEEP_PREPARED_AUDIO", False)
-        self.tag_silence_min_sec = max(0.0, getenv_float("WHISPER_TAG_SILENCE_MIN_SEC", 5.0))
+        self.tag_silence_min_sec = max(0.0, getenv_float("WHISPER_TAG_SILENCE_MIN_SEC", 3.0))
         self.tag_silence_dbfs = getenv_float("WHISPER_TAG_SILENCE_DBFS", -38.0)
         self.tag_music_min_sec = max(0.0, getenv_float("WHISPER_TAG_MUSIC_MIN_SEC", 3.0))
         self.tag_music_max_zcr = max(0.0, getenv_float("WHISPER_TAG_MUSIC_MAX_ZCR", 0.08))
@@ -103,10 +105,10 @@ class TranscriptionWorker:
             0.0, getenv_float("WHISPER_TAG_MUSIC_MAX_ENERGY_VARIATION", 0.35)
         )
         self.tag_unintelligible_max_avg_logprob = getenv_float(
-            "WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOGPROB", -1.15
+            "WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOGPROB", -1.25
         )
         self.tag_unintelligible_min_no_speech_prob = getenv_float(
-            "WHISPER_TAG_UNINTELLIGIBLE_MIN_NO_SPEECH_PROB", 0.55
+            "WHISPER_TAG_UNINTELLIGIBLE_MIN_NO_SPEECH_PROB", 0.60
         )
         self.tag_unintelligible_max_compression_ratio = getenv_float(
             "WHISPER_TAG_UNINTELLIGIBLE_MAX_COMPRESSION_RATIO", 2.4
@@ -221,21 +223,23 @@ class TranscriptionWorker:
                 "min_silence_duration_ms": self.vad_min_silence_duration_ms,
                 "speech_pad_ms": self.vad_speech_pad_ms,
             }
-        segments, info = model.transcribe(
-            audio_path,
-            language=self.language,
-            task=self.task,
-            beam_size=self.beam_size,
-            best_of=self.best_of,
-            temperature=self.temperature,
-            vad_filter=self.vad_filter,
-            vad_parameters=vad_parameters,
-            condition_on_previous_text=condition_on_previous_text,
-            initial_prompt=initial_prompt,
-            no_speech_threshold=self.no_speech_threshold,
-            log_prob_threshold=self.log_prob_threshold,
-            compression_ratio_threshold=self.compression_ratio_threshold,
-        )
+        transcribe_kwargs = {
+            "language": self.language,
+            "task": self.task,
+            "beam_size": self.beam_size,
+            "best_of": self.best_of,
+            "temperature": self.temperature,
+            "vad_filter": self.vad_filter,
+            "vad_parameters": vad_parameters,
+            "condition_on_previous_text": condition_on_previous_text,
+            "initial_prompt": initial_prompt,
+            "no_speech_threshold": self.no_speech_threshold,
+            "log_prob_threshold": self.log_prob_threshold,
+            "compression_ratio_threshold": self.compression_ratio_threshold,
+        }
+        if "chunk_length" in inspect.signature(model.transcribe).parameters:
+            transcribe_kwargs["chunk_length"] = self.chunk_length_s
+        segments, info = model.transcribe(audio_path, **transcribe_kwargs)
         segment_rows = []
         for segment in segments:
             segment_rows.append(

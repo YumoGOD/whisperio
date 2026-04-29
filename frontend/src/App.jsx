@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Document, Packer, Paragraph, TextRun } from "docx";
 import { createJob, fetchJob, fetchJobs, getJobAudioUrl } from "./api";
 
 const STATUS_LABELS = {
@@ -27,6 +28,24 @@ function formatTimestamp(seconds) {
   const min = String(totalMin % 60).padStart(2, "0");
   const hrs = String(Math.floor(totalMin / 60)).padStart(2, "0");
   return `${hrs}:${min}:${sec}.${ms}`;
+}
+
+function formatTimestampHms(seconds) {
+  const totalSec = Math.max(0, Math.round(Number(seconds) || 0));
+  const sec = String(totalSec % 60).padStart(2, "0");
+  const totalMin = Math.floor(totalSec / 60);
+  const min = String(totalMin % 60).padStart(2, "0");
+  const hrs = String(Math.floor(totalMin / 60)).padStart(2, "0");
+  return `${hrs}:${min}:${sec}`;
+}
+
+function buildWordFilename(originalFilename) {
+  const baseName = (originalFilename || "transcript").replace(/\.[^/.]+$/, "").trim();
+  const safeName = baseName
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim();
+  return `${safeName || "transcript"}_transcript.docx`;
 }
 
 function formatDateTime(value) {
@@ -205,6 +224,60 @@ function App() {
     }
   }
 
+  async function onDownloadWord() {
+    if (!selectedJob || selectedJob.status !== "done") {
+      return;
+    }
+    const segments = selectedJob.segments || [];
+    if (segments.length === 0) {
+      setJobError("Для этой задачи нет сегментов для экспорта.");
+      return;
+    }
+
+    try {
+      setJobError("");
+      const docParagraphs = [];
+      segments.forEach((segment, index) => {
+        docParagraphs.push(
+          new Paragraph({
+            children: [
+              new TextRun(
+                `(${formatTimestampHms(segment.start_sec)}-${formatTimestampHms(segment.end_sec)})`
+              ),
+            ],
+          }),
+          new Paragraph({
+            children: [new TextRun(segment.text || "")],
+          })
+        );
+
+        if (index < segments.length - 1) {
+          docParagraphs.push(new Paragraph(""));
+        }
+      });
+
+      const doc = new Document({
+        sections: [
+          {
+            children: docParagraphs,
+          },
+        ],
+      });
+
+      const blob = await Packer.toBlob(doc);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = buildWordFilename(selectedJob.original_filename);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setJobError(`Не удалось сформировать Word-файл: ${error?.message || "неизвестная ошибка"}`);
+    }
+  }
+
   return (
     <div className="page app-shell">
       <header className="topbar card">
@@ -344,6 +417,16 @@ function App() {
                       selectedJob.transcribe_duration_ms ?? selectedJob.processing_duration_ms
                     )}
                   </p>
+                  <div className="result-actions">
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={onDownloadWord}
+                      disabled={selectedJob.segments.length === 0}
+                    >
+                      Скачать Word (.docx)
+                    </button>
+                  </div>
                   <audio
                     key={selectedJob.id}
                     ref={audioRef}
