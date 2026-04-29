@@ -14,9 +14,9 @@ services:
       # Тип вычислений: int8 ускоряет и снижает RAM, с небольшой потерей точности.
       WHISPER_COMPUTE_TYPE: int8
       # Потоки на один инференс модели.
-      WHISPER_CPU_THREADS: "12"
+      WHISPER_CPU_THREADS: "8"
       # Внутренние workers CTranslate2.
-      WHISPER_MODEL_WORKERS: "4"
+      WHISPER_MODEL_WORKERS: "1"
 
       # ==== Language / task ====
       # Фиксируем русский язык для лучшей точности (без автоопределения).
@@ -26,13 +26,12 @@ services:
       # ==== Decode quality/speed ====
       # Beam/best_of: выше = точнее, но сильно медленнее.
       WHISPER_BEAM_SIZE: 1
-      WHISPER_BEST_OF: "1"
       # Температура 0.0 даёт максимально детерминированный результат.
       WHISPER_TEMPERATURE: 0.0
       # Начальный промпт (если не нужен — пустая строка).
       WHISPER_INITIAL_PROMPT: ""
       # Учитывать предыдущий текст: обычно повышает связность, но немного снижает скорость.
-      WHISPER_CONDITION_ON_PREVIOUS_TEXT: "true"
+      WHISPER_CONDITION_ON_PREVIOUS_TEXT: "false"
 
       # ==== VAD and segmentation ====
       # VAD отрезает неречевые участки до декодирования: ускоряет и уменьшает шум.
@@ -49,6 +48,8 @@ services:
       WHISPER_COMPRESSION_RATIO_THRESHOLD: "2.4"
 
       # ==== Tags: <Тишина> / <Музыка> / <Неразборчиво> ====
+      # Общий выключатель спец-тегов: false = не вставлять служебные метки.
+      WHISPER_ENABLE_TAGS: "false"
       # Минимальная пауза (сек) для тега <Тишина>.
       WHISPER_TAG_SILENCE_MIN_SEC: "3.0"
       # dBFS-порог тишины: ниже (например -42) = чаще <Тишина>; выше = реже.
@@ -65,7 +66,7 @@ services:
 
       # ==== Quality guard ====
       # Повторный прогон при аномалиях (может улучшить качество, но увеличивает время).
-      WHISPER_ENABLE_QUALITY_FALLBACK: "true"
+      WHISPER_ENABLE_QUALITY_FALLBACK: "false"
       WHISPER_MIN_UNIQUE_SEGMENT_RATIO: "0.25"
       WHISPER_MAX_TOP_REPEAT_RATIO: "0.7"
       WHISPER_MAX_PROMPT_MATCH_RATIO: "0.5"
@@ -80,7 +81,8 @@ services:
       WHISPER_KEEP_PREPARED_AUDIO: "false"
 
       # ==== Parallelism ====
-      # Баланс на 64 CPU cores: 4 воркера x 12 threads.
+      # Очередь: несколько async-воркеров могут параллелить этапы пайплайна.
+      # Вызовы transcribe сериализуются для shared-модели (безопасный режим).
       WHISPER_WORKERS: "4"
       # Глобальные лимиты потоков math-библиотек.
       OMP_NUM_THREADS: "12"

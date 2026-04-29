@@ -79,6 +79,11 @@ async def lifespan(_: FastAPI):
         for idx in range(worker_count)
     ]
     logger.info("event=workers_started count=%s", worker_count)
+    if worker_count > 1:
+        logger.info(
+            "event=transcribe_calls_serialized reason=shared_whisper_model count=%s",
+            worker_count,
+        )
     try:
         yield
     finally:

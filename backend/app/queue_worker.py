@@ -17,23 +17,43 @@ from faster_whisper import WhisperModel
 from app.db import get_connection
 from app.models import JobStage, JobStatus
 
+CONFIG_LOGGER = logging.getLogger("whisperio.worker.config")
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _warn_config(name: str, value: object, default: object, reason: str) -> None:
+    CONFIG_LOGGER.warning(
+        "event=invalid_whisper_config name=%s raw_value=%s fallback=%s reason=%s",
+        name,
+        value,
+        default,
+        reason,
+    )
 
 
 def getenv_int(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None:
         return default
-    return int(value)
+    try:
+        return int(value)
+    except ValueError:
+        _warn_config(name, value, default, "invalid_integer")
+        return default
 
 
 def getenv_float(name: str, default: float) -> float:
     value = os.getenv(name)
     if value is None:
         return default
-    return float(value)
+    try:
+        return float(value)
+    except ValueError:
+        _warn_config(name, value, default, "invalid_float")
+        return default
 
 
 def getenv_bool(name: str, default: bool) -> bool:
@@ -41,7 +61,66 @@ def getenv_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     normalized = value.strip().lower()
-    return normalized in {"1", "true", "yes", "on"}
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    _warn_config(name, value, default, "invalid_boolean")
+    return default
+
+
+def normalize_choice(name: str, value: str, allowed: set[str], default: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in allowed:
+        return normalized
+    _warn_config(name, value, default, f"unsupported_value:{','.join(sorted(allowed))}")
+    return default
+
+
+def clamp_config_float(
+    name: str,
+    value: float,
+    *,
+    min_value: float,
+    max_value: float,
+    default: float,
+) -> float:
+    if not math.isfinite(value):
+        _warn_config(name, value, default, "non_finite_float")
+        return default
+    if value < min_value:
+        _warn_config(name, value, min_value, f"below_min:{min_value}")
+        return min_value
+    if value > max_value:
+        _warn_config(name, value, max_value, f"above_max:{max_value}")
+        return max_value
+    return value
+
+
+def ensure_config_min_int(name: str, value: int, *, min_value: int, default: int) -> int:
+    if value >= min_value:
+        return value
+    fallback = max(min_value, default)
+    _warn_config(name, value, fallback, f"below_min:{min_value}")
+    return fallback
+
+
+def ensure_config_min_float(name: str, value: float, *, min_value: float, default: float) -> float:
+    if not math.isfinite(value):
+        _warn_config(name, value, default, "non_finite_float")
+        return default
+    if value >= min_value:
+        return value
+    fallback = max(min_value, default)
+    _warn_config(name, value, fallback, f"below_min:{min_value}")
+    return fallback
+
+
+def ensure_finite_float(name: str, value: float, default: float) -> float:
+    if math.isfinite(value):
+        return value
+    _warn_config(name, value, default, "non_finite_float")
+    return default
 
 
 def clamp_progress(value: float | None) -> float | None:
@@ -75,20 +154,70 @@ class TranscriptionWorker:
         self.model_workers = max(1, getenv_int("WHISPER_MODEL_WORKERS", 4))
         self.model: WhisperModel | None = None
         self._model_lock = asyncio.Lock()
-        self.language = os.getenv("WHISPER_LANGUAGE", "ru")
-        self.task = os.getenv("WHISPER_TASK", "transcribe")
-        self.beam_size = getenv_int("WHISPER_BEAM_SIZE", 1)
-        self.best_of = getenv_int("WHISPER_BEST_OF", 1)
-        self.temperature = getenv_float("WHISPER_TEMPERATURE", 0.0)
+        self._transcribe_lock = asyncio.Lock()
+        language_raw = os.getenv("WHISPER_LANGUAGE", "ru")
+        self.language = language_raw.strip() or "ru"
+        if not language_raw.strip():
+            _warn_config("WHISPER_LANGUAGE", language_raw, "ru", "empty_language")
+        self.task = normalize_choice(
+            "WHISPER_TASK",
+            os.getenv("WHISPER_TASK", "transcribe"),
+            {"transcribe", "translate"},
+            "transcribe",
+        )
+        self.beam_size = ensure_config_min_int(
+            "WHISPER_BEAM_SIZE",
+            getenv_int("WHISPER_BEAM_SIZE", 1),
+            min_value=1,
+            default=1,
+        )
+        self.temperature = clamp_config_float(
+            "WHISPER_TEMPERATURE",
+            getenv_float("WHISPER_TEMPERATURE", 0.0),
+            min_value=0.0,
+            max_value=1.0,
+            default=0.0,
+        )
         self.initial_prompt = os.getenv("WHISPER_INITIAL_PROMPT", "").strip() or None
         self.condition_on_previous_text = getenv_bool("WHISPER_CONDITION_ON_PREVIOUS_TEXT", True)
         self.vad_filter = getenv_bool("WHISPER_VAD_FILTER", True)
-        self.vad_threshold = getenv_float("WHISPER_VAD_THRESHOLD", 0.6)
-        self.vad_min_silence_duration_ms = getenv_int("WHISPER_VAD_MIN_SILENCE_DURATION_MS", 700)
-        self.vad_speech_pad_ms = getenv_int("WHISPER_VAD_SPEECH_PAD_MS", 300)
-        self.no_speech_threshold = getenv_float("WHISPER_NO_SPEECH_THRESHOLD", 0.45)
-        self.log_prob_threshold = getenv_float("WHISPER_LOG_PROB_THRESHOLD", -1.0)
-        self.compression_ratio_threshold = getenv_float("WHISPER_COMPRESSION_RATIO_THRESHOLD", 2.4)
+        self.vad_threshold = clamp_config_float(
+            "WHISPER_VAD_THRESHOLD",
+            getenv_float("WHISPER_VAD_THRESHOLD", 0.6),
+            min_value=0.0,
+            max_value=1.0,
+            default=0.6,
+        )
+        self.vad_min_silence_duration_ms = ensure_config_min_int(
+            "WHISPER_VAD_MIN_SILENCE_DURATION_MS",
+            getenv_int("WHISPER_VAD_MIN_SILENCE_DURATION_MS", 700),
+            min_value=0,
+            default=700,
+        )
+        self.vad_speech_pad_ms = ensure_config_min_int(
+            "WHISPER_VAD_SPEECH_PAD_MS",
+            getenv_int("WHISPER_VAD_SPEECH_PAD_MS", 300),
+            min_value=0,
+            default=300,
+        )
+        self.no_speech_threshold = clamp_config_float(
+            "WHISPER_NO_SPEECH_THRESHOLD",
+            getenv_float("WHISPER_NO_SPEECH_THRESHOLD", 0.45),
+            min_value=0.0,
+            max_value=1.0,
+            default=0.45,
+        )
+        self.log_prob_threshold = ensure_finite_float(
+            "WHISPER_LOG_PROB_THRESHOLD",
+            getenv_float("WHISPER_LOG_PROB_THRESHOLD", -1.0),
+            -1.0,
+        )
+        self.compression_ratio_threshold = ensure_config_min_float(
+            "WHISPER_COMPRESSION_RATIO_THRESHOLD",
+            getenv_float("WHISPER_COMPRESSION_RATIO_THRESHOLD", 2.4),
+            min_value=0.0,
+            default=2.4,
+        )
         self.enable_quality_fallback = getenv_bool("WHISPER_ENABLE_QUALITY_FALLBACK", True)
         self.min_unique_ratio = getenv_float("WHISPER_MIN_UNIQUE_SEGMENT_RATIO", 0.25)
         self.max_top_repeat_ratio = getenv_float("WHISPER_MAX_TOP_REPEAT_RATIO", 0.7)
@@ -97,6 +226,7 @@ class TranscriptionWorker:
         self.preprocess_timeout_sec = getenv_int("WHISPER_PREPROCESS_TIMEOUT_SEC", 1800)
         self.chunk_length_s = max(1, getenv_int("WHISPER_CHUNK_LENGTH_S", 20))
         self.keep_prepared_audio = getenv_bool("WHISPER_KEEP_PREPARED_AUDIO", False)
+        self.enable_tags = getenv_bool("WHISPER_ENABLE_TAGS", True)
         self.tag_silence_min_sec = max(0.0, getenv_float("WHISPER_TAG_SILENCE_MIN_SEC", 3.0))
         self.tag_silence_dbfs = getenv_float("WHISPER_TAG_SILENCE_DBFS", -38.0)
         self.tag_music_min_sec = max(0.0, getenv_float("WHISPER_TAG_MUSIC_MIN_SEC", 3.0))
@@ -209,6 +339,24 @@ class TranscriptionWorker:
                 )
         return self.model
 
+    async def _run_transcribe(
+        self,
+        model: WhisperModel,
+        audio_path: str,
+        initial_prompt: str | None,
+        condition_on_previous_text: bool,
+    ):
+        # A single shared WhisperModel instance is used by multiple queue workers.
+        # Serialize inference calls to avoid undefined behavior from concurrent transcribe.
+        async with self._transcribe_lock:
+            return await asyncio.to_thread(
+                self._transcribe_audio,
+                model,
+                audio_path,
+                initial_prompt,
+                condition_on_previous_text,
+            )
+
     def _transcribe_audio(
         self,
         model: WhisperModel,
@@ -227,7 +375,6 @@ class TranscriptionWorker:
             "language": self.language,
             "task": self.task,
             "beam_size": self.beam_size,
-            "best_of": self.best_of,
             "temperature": self.temperature,
             "vad_filter": self.vad_filter,
             "vad_parameters": vad_parameters,
@@ -476,6 +623,23 @@ class TranscriptionWorker:
         audio_path: str,
         audio_duration_sec: float,
     ) -> tuple[list[tuple[float, float, str]], dict[str, object]]:
+        if not self.enable_tags:
+            decorated = []
+            for segment in raw_segments:
+                start_sec = max(0.0, float(segment["start_sec"]))
+                end_sec = max(start_sec, float(segment["end_sec"]))
+                text = str(segment.get("text", "")).strip()
+                if text:
+                    decorated.append((start_sec, end_sec, text))
+            return decorated, {
+                "inserted_tags": {
+                    TAG_SILENCE: 0,
+                    TAG_MUSIC: 0,
+                    TAG_UNINTELLIGIBLE: 0,
+                },
+                "gap_metrics": [],
+            }
+
         samples, sample_rate = self._load_pcm16_audio(audio_path)
         decorated: list[tuple[float, float, str]] = []
         inserted_counts = {
@@ -629,8 +793,7 @@ class TranscriptionWorker:
                 status=JobStatus.PROCESSING,
                 progress=20.0,
             )
-            primary_rows, info = await asyncio.to_thread(
-                self._transcribe_audio,
+            primary_rows, info = await self._run_transcribe(
                 model,
                 prepared_audio_path or audio_path,
                 self.initial_prompt,
@@ -660,8 +823,7 @@ class TranscriptionWorker:
                         f"quality guard failed: {','.join(quality_primary['reasons'])}"
                     )
                 fallback_used = True
-                fallback_rows, info = await asyncio.to_thread(
-                    self._transcribe_audio,
+                fallback_rows, info = await self._run_transcribe(
                     model,
                     prepared_audio_path or audio_path,
                     None,
