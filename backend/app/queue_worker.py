@@ -7,8 +7,6 @@ import os
 import subprocess
 import tempfile
 import time
-import wave
-from array import array
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -151,13 +149,7 @@ class QualityGuardError(RuntimeError):
     pass
 
 
-TAG_SILENCE = "<Тишина>"
-TAG_MUSIC = "<Музыка>"
-TAG_UNINTELLIGIBLE = "<Неразборчиво>"
 LABEL_SPEECH = "speech"
-LABEL_SILENCE = "silence"
-LABEL_MUSIC = "music"
-LABEL_UNCLEAR = "unclear"
 
 
 class TranscriptionWorker:
@@ -264,25 +256,6 @@ class TranscriptionWorker:
         )
         self.chunk_length_s = max(1, getenv_int("WHISPER_CHUNK_LENGTH_S", 20))
         self.keep_prepared_audio = getenv_bool("WHISPER_KEEP_PREPARED_AUDIO", True)
-        self.enable_tags = getenv_bool("WHISPER_ENABLE_TAGS", True)
-        self.tag_silence_min_sec = max(0.0, getenv_float("WHISPER_TAG_SILENCE_MIN_SEC", 3.0))
-        self.tag_silence_dbfs = getenv_float("WHISPER_TAG_SILENCE_DBFS", -38.0)
-        self.tag_music_min_sec = max(0.0, getenv_float("WHISPER_TAG_MUSIC_MIN_SEC", 3.0))
-        self.tag_music_max_zcr = max(0.0, getenv_float("WHISPER_TAG_MUSIC_MAX_ZCR", 0.08))
-        self.tag_music_max_energy_variation = max(
-            0.0, getenv_float("WHISPER_TAG_MUSIC_MAX_ENERGY_VARIATION", 0.35)
-        )
-        # Support both env names to avoid silent misconfiguration.
-        self.tag_unintelligible_max_avg_logprob = getenv_float(
-            "WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOG_PROB",
-            getenv_float("WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOGPROB", -1.25),
-        )
-        self.tag_unintelligible_min_no_speech_prob = getenv_float(
-            "WHISPER_TAG_UNINTELLIGIBLE_MIN_NO_SPEECH_PROB", 0.60
-        )
-        self.tag_unintelligible_max_compression_ratio = getenv_float(
-            "WHISPER_TAG_UNINTELLIGIBLE_MAX_COMPRESSION_RATIO", 2.4
-        )
         self.sla_rtf_threshold = max(0.01, getenv_float("WHISPER_SLA_RTF_THRESHOLD", 0.25))
         self.resource_snapshot_interval_sec = max(
             1, getenv_int("LOG_SNAPSHOT_INTERVAL_SEC", 10)
@@ -571,104 +544,6 @@ class TranscriptionWorker:
             "is_anomaly": bool(reasons),
         }
 
-    def _read_pcm_interval(
-        self,
-        wav_file: wave.Wave_read,
-        sample_rate: int,
-        start_sec: float,
-        end_sec: float,
-    ) -> array:
-        start_frame = max(0, int(start_sec * sample_rate))
-        end_frame = max(start_frame, int(end_sec * sample_rate))
-        frame_count = end_frame - start_frame
-        if frame_count <= 0:
-            return array("h")
-        wav_file.setpos(start_frame)
-        frames = wav_file.readframes(frame_count)
-        samples = array("h")
-        samples.frombytes(frames)
-        return samples
-
-    def _audio_interval_metrics(self, interval_samples: array) -> dict[str, float]:
-        sample_count = len(interval_samples)
-        if sample_count == 0:
-            return {"rms_dbfs": -120.0, "zcr": 0.0, "energy_variation": 0.0}
-
-        squares_sum = 0.0
-        zero_crossings = 0
-        prev = interval_samples[0]
-        frame_size = 800  # ~50ms at 16kHz.
-        frame_rms_values: list[float] = []
-        frame_squares_sum = 0.0
-        frame_samples = 0
-        for idx, current in enumerate(interval_samples):
-            value = float(current)
-            squares_sum += value * value
-            frame_squares_sum += value * value
-            frame_samples += 1
-            if idx > 0 and ((prev >= 0 > current) or (prev < 0 <= current)):
-                zero_crossings += 1
-            prev = current
-            if frame_samples == frame_size:
-                frame_rms_values.append(math.sqrt(frame_squares_sum / frame_samples) / 32768.0)
-                frame_squares_sum = 0.0
-                frame_samples = 0
-        if frame_samples > 0:
-            frame_rms_values.append(math.sqrt(frame_squares_sum / frame_samples) / 32768.0)
-
-        rms = math.sqrt(squares_sum / sample_count) / 32768.0
-        rms_dbfs = 20.0 * math.log10(max(rms, 1e-8))
-        zcr = zero_crossings / max(1, sample_count - 1)
-        energy_mean = sum(frame_rms_values) / max(1, len(frame_rms_values))
-        if energy_mean <= 1e-8 or len(frame_rms_values) < 2:
-            energy_variation = 0.0
-        else:
-            variance = sum((item - energy_mean) ** 2 for item in frame_rms_values) / (
-                len(frame_rms_values) - 1
-            )
-            energy_variation = math.sqrt(max(variance, 0.0)) / energy_mean
-
-        return {
-            "rms_dbfs": rms_dbfs,
-            "zcr": zcr,
-            "energy_variation": energy_variation,
-        }
-
-    def _is_unintelligible(self, segment: dict[str, float | str]) -> bool:
-        avg_logprob = float(segment.get("avg_logprob", 0.0))
-        no_speech_prob = float(segment.get("no_speech_prob", 0.0))
-        compression_ratio = float(segment.get("compression_ratio", 0.0))
-        text = str(segment.get("text", "")).strip()
-        if not text:
-            return False
-        return (
-            avg_logprob <= self.tag_unintelligible_max_avg_logprob
-            and no_speech_prob >= self.tag_unintelligible_min_no_speech_prob
-            and compression_ratio >= self.tag_unintelligible_max_compression_ratio
-        )
-
-    def _classify_gap(
-        self,
-        wav_file: wave.Wave_read,
-        sample_rate: int,
-        gap_start_sec: float,
-        gap_end_sec: float,
-    ) -> tuple[str, dict[str, float]]:
-        gap_duration = max(0.0, gap_end_sec - gap_start_sec)
-        interval = self._read_pcm_interval(wav_file, sample_rate, gap_start_sec, gap_end_sec)
-        metrics = self._audio_interval_metrics(interval)
-        if gap_duration <= 0.0:
-            return LABEL_SILENCE, metrics
-        if metrics["rms_dbfs"] <= self.tag_silence_dbfs or gap_duration < self.tag_silence_min_sec:
-            return LABEL_SILENCE, metrics
-        if (
-            gap_duration >= self.tag_music_min_sec
-            and metrics["zcr"] <= self.tag_music_max_zcr
-            and metrics["energy_variation"] <= self.tag_music_max_energy_variation
-        ):
-            return LABEL_MUSIC, metrics
-        return LABEL_UNCLEAR, metrics
-
     def _asr_segment_to_timeline_item(
         self,
         start_sec: float,
@@ -677,47 +552,18 @@ class TranscriptionWorker:
     ) -> dict[str, object]:
         text = str(segment.get("text", "")).strip()
         avg_logprob = float(segment.get("avg_logprob", 0.0))
-        is_unintelligible = self._is_unintelligible(segment)
         label = LABEL_SPEECH
         confidence = max(0.0, min(1.0, math.exp(min(0.0, avg_logprob))))
-        quality_flags = {
-            "avg_logprob": round(avg_logprob, 4),
-            "no_speech_prob": round(float(segment.get("no_speech_prob", 0.0)), 4),
-            "compression_ratio": round(float(segment.get("compression_ratio", 0.0)), 4),
-        }
-        if is_unintelligible:
-            quality_flags["unintelligible_hint"] = True
         return {
             "start_sec": start_sec,
             "end_sec": end_sec,
             "label": label,
             "text": text,
             "confidence": round(confidence, 4),
-            "quality_flags": quality_flags,
-        }
-
-    def _make_non_speech_segment(
-        self,
-        start_sec: float,
-        end_sec: float,
-        label: str,
-        metrics: dict[str, float],
-    ) -> dict[str, object]:
-        label_to_text = {
-            LABEL_SILENCE: TAG_SILENCE,
-            LABEL_MUSIC: TAG_MUSIC,
-            LABEL_UNCLEAR: TAG_UNINTELLIGIBLE,
-        }
-        return {
-            "start_sec": start_sec,
-            "end_sec": end_sec,
-            "label": label,
-            "text": label_to_text.get(label, TAG_UNINTELLIGIBLE),
-            "confidence": 1.0,
             "quality_flags": {
-                "rms_dbfs": round(metrics["rms_dbfs"], 4),
-                "zcr": round(metrics["zcr"], 6),
-                "energy_variation": round(metrics["energy_variation"], 6),
+                "avg_logprob": round(avg_logprob, 4),
+                "no_speech_prob": round(float(segment.get("no_speech_prob", 0.0)), 4),
+                "compression_ratio": round(float(segment.get("compression_ratio", 0.0)), 4),
             },
         }
 
@@ -840,108 +686,33 @@ class TranscriptionWorker:
     def _decorate_segments(
         self,
         raw_segments: list[dict[str, float | str]],
-        audio_path: str,
-        audio_duration_sec: float,
+        _audio_path: str,
+        _audio_duration_sec: float,
     ) -> tuple[list[dict[str, object]], dict[str, object]]:
-        if not self.enable_tags:
-            decorated: list[dict[str, object]] = []
-            for segment in raw_segments:
-                start_sec = max(0.0, float(segment["start_sec"]))
-                end_sec = max(start_sec, float(segment["end_sec"]))
-                text = str(segment.get("text", "")).strip()
-                if text:
-                    decorated.append(self._asr_segment_to_timeline_item(start_sec, end_sec, segment))
-            return decorated, {
-                "inserted_labels": {
-                    LABEL_SILENCE: 0,
-                    LABEL_MUSIC: 0,
-                    LABEL_UNCLEAR: 0,
-                    LABEL_SPEECH: sum(1 for segment in decorated if segment["label"] == LABEL_SPEECH),
-                },
-                "gap_metrics": [],
-            }
+        decorated: list[dict[str, object]] = []
+        for segment in sorted(
+            raw_segments,
+            key=lambda item: (
+                max(0.0, float(item["start_sec"])),
+                max(0.0, float(item["end_sec"])),
+            ),
+        ):
+            start_sec = max(0.0, float(segment["start_sec"]))
+            end_sec = max(start_sec, float(segment["end_sec"]))
+            text = str(segment.get("text", "")).strip()
+            if not text:
+                continue
+            decorated.append(self._asr_segment_to_timeline_item(start_sec, end_sec, segment))
 
-        with wave.open(audio_path, "rb") as wav_file:
-            sample_rate = wav_file.getframerate()
-            sample_width = wav_file.getsampwidth()
-            if sample_width != 2:
-                raise AudioPreprocessError("prepared audio must be 16-bit PCM")
-            decorated: list[dict[str, object]] = []
-            inserted_counts = {
-                LABEL_SILENCE: 0,
-                LABEL_MUSIC: 0,
-                LABEL_UNCLEAR: 0,
-                LABEL_SPEECH: 0,
-            }
-            gap_metrics: list[dict[str, float | str]] = []
-            previous_end = 0.0
-            sorted_segments = sorted(
-                raw_segments,
-                key=lambda item: (
-                    max(0.0, float(item["start_sec"])),
-                    max(0.0, float(item["end_sec"])),
-                ),
-            )
-            for segment in sorted_segments:
-                start_sec = max(0.0, float(segment["start_sec"]))
-                end_sec = max(start_sec, float(segment["end_sec"]))
-                if start_sec > previous_end:
-                    gap_label, metrics = self._classify_gap(
-                        wav_file,
-                        sample_rate,
-                        previous_end,
-                        start_sec,
-                    )
-                    decorated.append(
-                        self._make_non_speech_segment(previous_end, start_sec, gap_label, metrics)
-                    )
-                    inserted_counts[gap_label] += 1
-                    gap_metrics.append(
-                        {
-                            "start_sec": round(previous_end, 3),
-                            "end_sec": round(start_sec, 3),
-                            "label": gap_label,
-                            "rms_dbfs": round(metrics["rms_dbfs"], 4),
-                            "zcr": round(metrics["zcr"], 6),
-                            "energy_variation": round(metrics["energy_variation"], 6),
-                        }
-                    )
-                if end_sec <= previous_end:
-                    continue
-                if start_sec < previous_end:
-                    start_sec = previous_end
-                text = str(segment.get("text", "")).strip()
-                if not text:
-                    previous_end = end_sec
-                    continue
-                timeline_item = self._asr_segment_to_timeline_item(start_sec, end_sec, segment)
-                decorated.append(timeline_item)
-                inserted_counts[str(timeline_item["label"])] += 1
-                previous_end = end_sec
-
-            tail_end = max(previous_end, float(audio_duration_sec or 0.0))
-            if tail_end > previous_end:
-                tail_label, metrics = self._classify_gap(
-                    wav_file,
-                    sample_rate,
-                    previous_end,
-                    tail_end,
-                )
-                decorated.append(
-                    self._make_non_speech_segment(previous_end, tail_end, tail_label, metrics)
-                )
-                inserted_counts[tail_label] += 1
-                gap_metrics.append(
-                    {
-                        "start_sec": round(previous_end, 3),
-                        "end_sec": round(tail_end, 3),
-                        "label": tail_label,
-                        "rms_dbfs": round(metrics["rms_dbfs"], 4),
-                        "zcr": round(metrics["zcr"], 6),
-                        "energy_variation": round(metrics["energy_variation"], 6),
-                    }
-                )
-        return decorated, {"inserted_labels": inserted_counts, "gap_metrics": gap_metrics}
+        return decorated, {
+            "inserted_labels": {
+                "silence": 0,
+                "music": 0,
+                "unclear": 0,
+                "speech": len(decorated),
+            },
+            "gap_metrics": [],
+        }
 
     async def _process_job(self, job_id: str) -> None:
         started_wall_time = time.perf_counter()
@@ -1210,10 +981,10 @@ class TranscriptionWorker:
                     "fallback_used": fallback_used,
                     "preprocess_duration_ms": preprocess_duration_ms,
                     "decorate_duration_ms": decorate_duration_ms,
-                    "tag_silence_count": tagging_stats["inserted_labels"][LABEL_SILENCE],
-                    "tag_music_count": tagging_stats["inserted_labels"][LABEL_MUSIC],
-                    "tag_unclear_count": tagging_stats["inserted_labels"][LABEL_UNCLEAR],
-                    "speech_count": tagging_stats["inserted_labels"][LABEL_SPEECH],
+                    "tag_silence_count": tagging_stats["inserted_labels"]["silence"],
+                    "tag_music_count": tagging_stats["inserted_labels"]["music"],
+                    "tag_unclear_count": tagging_stats["inserted_labels"]["unclear"],
+                    "speech_count": tagging_stats["inserted_labels"]["speech"],
                 },
             )
             persist_started = time.perf_counter()

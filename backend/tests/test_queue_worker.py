@@ -115,8 +115,7 @@ def test_quality_analysis_can_trigger_and_clear_anomaly():
     assert clean["is_anomaly"] is False
 
 
-def test_decorate_segments_skips_tagging_when_disabled(monkeypatch):
-    monkeypatch.setenv("WHISPER_ENABLE_TAGS", "false")
+def test_decorate_segments_returns_speech_only_segments():
     worker = TranscriptionWorker()
     raw_segments = [
         {
@@ -158,7 +157,6 @@ def test_decorate_segments_skips_tagging_when_disabled(monkeypatch):
                 "avg_logprob": -2.0,
                 "no_speech_prob": 0.9,
                 "compression_ratio": 3.0,
-                "unintelligible_hint": True,
             },
         },
         {
@@ -171,7 +169,6 @@ def test_decorate_segments_skips_tagging_when_disabled(monkeypatch):
                 "avg_logprob": -2.0,
                 "no_speech_prob": 0.9,
                 "compression_ratio": 3.0,
-                "unintelligible_hint": True,
             },
         },
     ]
@@ -184,13 +181,24 @@ def test_decorate_segments_skips_tagging_when_disabled(monkeypatch):
     assert tagging_stats["gap_metrics"] == []
 
 
-def test_unintelligible_logprob_env_name_supported(monkeypatch):
-    monkeypatch.delenv("WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOGPROB", raising=False)
-    monkeypatch.setenv("WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOG_PROB", "-0.95")
-
+def test_decorate_segments_never_inserts_marker_texts():
     worker = TranscriptionWorker()
+    raw_segments = [
+        {
+            "start_sec": 0.0,
+            "end_sec": 1.0,
+            "text": "тихая фраза",
+            "avg_logprob": -3.0,
+            "no_speech_prob": 0.99,
+            "compression_ratio": 4.0,
+        }
+    ]
 
-    assert worker.tag_unintelligible_max_avg_logprob == -0.95
+    decorated_rows, _ = worker._decorate_segments(raw_segments, "unused.wav", 1.0)
+
+    assert len(decorated_rows) == 1
+    assert decorated_rows[0]["text"] not in {"<Тишина>", "<Музыка>", "<Неразборчиво>"}
+    assert decorated_rows[0]["label"] == "speech"
 
 
 def test_chunk_plan_for_long_audio(monkeypatch):
