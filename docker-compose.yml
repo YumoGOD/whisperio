@@ -38,15 +38,15 @@ services:
       # VAD отрезает неречевые участки до декодирования: ускоряет и уменьшает шум.
       WHISPER_VAD_FILTER: "true"
       # Порог VAD: выше = строже, может потерять тихую речь; ниже = больше фонового шума.
-      WHISPER_VAD_THRESHOLD: "0.5"
+      WHISPER_VAD_THRESHOLD: "0.2"
       # Минимальная тишина для разрыва речи (мс): меньше = больше сегментов.
-      WHISPER_VAD_MIN_SILENCE_DURATION_MS: "500"
+      WHISPER_VAD_MIN_SILENCE_DURATION_MS: "250"
       # Дополнительный запас вокруг речи (мс): выше = меньше обрезаний концов слов.
-      WHISPER_VAD_SPEECH_PAD_MS: "400"
+      WHISPER_VAD_SPEECH_PAD_MS: "700"
       # Пороги декодера: влияют на отбраковку низкокачественных сегментов.
-      WHISPER_NO_SPEECH_THRESHOLD: "0.4"
-      WHISPER_LOG_PROB_THRESHOLD: "-1.0"
-      WHISPER_COMPRESSION_RATIO_THRESHOLD: "2.4"
+      WHISPER_NO_SPEECH_THRESHOLD: "0.15"
+      WHISPER_LOG_PROB_THRESHOLD: "-2.0"
+      WHISPER_COMPRESSION_RATIO_THRESHOLD: "3.2"
 
       # ==== Tags: <Тишина> / <Музыка> / <Неразборчиво> ====
       # Минимальная пауза (сек) для тега <Тишина>.
@@ -59,7 +59,7 @@ services:
       WHISPER_TAG_MUSIC_MAX_ZCR: "0.08"
       WHISPER_TAG_MUSIC_MAX_ENERGY_VARIATION: "0.35"
       # Пороги для <Неразборчиво>: ужесточение => больше таких меток.
-      WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOGPROB: "-1.15"
+      WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOG_PROB: "-1.15"
       WHISPER_TAG_UNINTELLIGIBLE_MIN_NO_SPEECH_PROB: "0.55"
       WHISPER_TAG_UNINTELLIGIBLE_MAX_COMPRESSION_RATIO: "2.4"
 
@@ -72,7 +72,7 @@ services:
 
       # ==== Preprocess / runtime ====
       # Максимальный размер загружаемого исходного файла (МБ).
-      MAX_UPLOAD_SIZE_MB: "1024"
+      MAX_UPLOAD_SIZE_MB: "3004"
       # Препроцессинг в mono/16kHz — стандарт для Whisper.
       WHISPER_PREPROCESS_SAMPLE_RATE: "16000"
       # Таймаут ffmpeg на подготовку.
@@ -80,7 +80,7 @@ services:
       # Профиль улучшения аудио: off | balanced | aggressive.
       WHISPER_ENHANCE_PROFILE: balanced
       # Для дебага можно оставить prepared wav.
-      WHISPER_KEEP_PREPARED_AUDIO: "false"
+      WHISPER_KEEP_PREPARED_AUDIO: "true"
       # Длина чанка для поддерживаемых версий faster-whisper.
       WHISPER_CHUNK_LENGTH_S: "30"
       # Внешнее чанкирование для длинных файлов.

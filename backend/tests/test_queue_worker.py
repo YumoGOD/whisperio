@@ -151,25 +151,27 @@ def test_decorate_segments_skips_tagging_when_disabled(monkeypatch):
         {
             "start_sec": 0.0,
             "end_sec": 1.2,
-            "label": "unclear",
-            "text": "<Неразборчиво>",
+            "label": "speech",
+            "text": "первая фраза",
             "confidence": 0.1353,
             "quality_flags": {
                 "avg_logprob": -2.0,
                 "no_speech_prob": 0.9,
                 "compression_ratio": 3.0,
+                "unintelligible_hint": True,
             },
         },
         {
             "start_sec": 2.0,
             "end_sec": 3.1,
-            "label": "unclear",
-            "text": "<Неразборчиво>",
+            "label": "speech",
+            "text": "вторая фраза",
             "confidence": 0.1353,
             "quality_flags": {
                 "avg_logprob": -2.0,
                 "no_speech_prob": 0.9,
                 "compression_ratio": 3.0,
+                "unintelligible_hint": True,
             },
         },
     ]
@@ -177,9 +179,18 @@ def test_decorate_segments_skips_tagging_when_disabled(monkeypatch):
         "silence": 0,
         "music": 0,
         "unclear": 0,
-        "speech": 0,
+        "speech": 2,
     }
     assert tagging_stats["gap_metrics"] == []
+
+
+def test_unintelligible_logprob_env_name_supported(monkeypatch):
+    monkeypatch.delenv("WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOGPROB", raising=False)
+    monkeypatch.setenv("WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOG_PROB", "-0.95")
+
+    worker = TranscriptionWorker()
+
+    assert worker.tag_unintelligible_max_avg_logprob == -0.95
 
 
 def test_chunk_plan_for_long_audio(monkeypatch):

@@ -272,8 +272,10 @@ class TranscriptionWorker:
         self.tag_music_max_energy_variation = max(
             0.0, getenv_float("WHISPER_TAG_MUSIC_MAX_ENERGY_VARIATION", 0.35)
         )
+        # Support both env names to avoid silent misconfiguration.
         self.tag_unintelligible_max_avg_logprob = getenv_float(
-            "WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOGPROB", -1.25
+            "WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOG_PROB",
+            getenv_float("WHISPER_TAG_UNINTELLIGIBLE_MAX_AVG_LOGPROB", -1.25),
         )
         self.tag_unintelligible_min_no_speech_prob = getenv_float(
             "WHISPER_TAG_UNINTELLIGIBLE_MIN_NO_SPEECH_PROB", 0.60
@@ -675,21 +677,23 @@ class TranscriptionWorker:
     ) -> dict[str, object]:
         text = str(segment.get("text", "")).strip()
         avg_logprob = float(segment.get("avg_logprob", 0.0))
-        label = LABEL_UNCLEAR if self._is_unintelligible(segment) else LABEL_SPEECH
-        if label == LABEL_UNCLEAR:
-            text = TAG_UNINTELLIGIBLE
+        is_unintelligible = self._is_unintelligible(segment)
+        label = LABEL_SPEECH
         confidence = max(0.0, min(1.0, math.exp(min(0.0, avg_logprob))))
+        quality_flags = {
+            "avg_logprob": round(avg_logprob, 4),
+            "no_speech_prob": round(float(segment.get("no_speech_prob", 0.0)), 4),
+            "compression_ratio": round(float(segment.get("compression_ratio", 0.0)), 4),
+        }
+        if is_unintelligible:
+            quality_flags["unintelligible_hint"] = True
         return {
             "start_sec": start_sec,
             "end_sec": end_sec,
             "label": label,
             "text": text,
             "confidence": round(confidence, 4),
-            "quality_flags": {
-                "avg_logprob": round(avg_logprob, 4),
-                "no_speech_prob": round(float(segment.get("no_speech_prob", 0.0)), 4),
-                "compression_ratio": round(float(segment.get("compression_ratio", 0.0)), 4),
-            },
+            "quality_flags": quality_flags,
         }
 
     def _make_non_speech_segment(
