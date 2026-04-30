@@ -1,13 +1,14 @@
 import logging
 import mimetypes
 import os
+import statistics
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -17,7 +18,16 @@ from app.logging_utils import bind_log_context, configure_logging, log_event, re
 from app.models import JobStage, JobStatus
 from app.queue_worker import utc_now_iso
 from app.runtime import TranscriptionRuntime
-from app.schemas import ErrorResponse, JobCreateResponse, JobDetail, JobListItem
+from app.schemas import (
+    ErrorResponse,
+    JobCreateResponse,
+    JobDeleteResponse,
+    JobDetail,
+    JobListItem,
+    JobStatsResponse,
+    SpeedBreakdown,
+    SpeedExtreme,
+)
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/uploads"))
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "200"))
@@ -30,9 +40,13 @@ ALLOWED_AUDIO_EXTENSIONS = {
     ".ogg",
     ".flac",
     ".aac",
+    ".avi",
     ".mp4",
+    ".mkv",
+    ".mov",
     ".webm",
 }
+AUDIO_CONTAINER_EXTENSIONS = {".avi", ".mp4", ".mkv", ".mov", ".webm"}
 AUDIO_MEDIA_TYPES = {
     ".mp3": "audio/mpeg",
     ".wav": "audio/wav",
@@ -40,7 +54,10 @@ AUDIO_MEDIA_TYPES = {
     ".ogg": "audio/ogg",
     ".flac": "audio/flac",
     ".aac": "audio/aac",
+    ".avi": "video/x-msvideo",
     ".mp4": "audio/mp4",
+    ".mkv": "video/x-matroska",
+    ".mov": "video/quicktime",
     ".webm": "audio/webm",
 }
 
@@ -262,6 +279,32 @@ def parse_dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value)
 
 
+def _safe_unlink(path_value: str | None) -> None:
+    if not path_value:
+        return
+    path = Path(path_value)
+    if path.exists() and path.is_file():
+        path.unlink(missing_ok=True)
+
+
+def _calc_hourly_ms(duration_sec: float | None, metric_ms: int | None) -> float | None:
+    if duration_sec is None or metric_ms is None:
+        return None
+    if duration_sec <= 0:
+        return None
+    return (float(metric_ms) * 3600.0) / float(duration_sec)
+
+
+def _avg_or_none(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(round(statistics.fmean(values), 2))
+
+
+def _audio_url(job_id: str, variant: str) -> str:
+    return f"/api/jobs/{job_id}/audio?variant={variant}"
+
+
 @app.get("/health")
 def health(request: Request):
     log_event(
@@ -293,15 +336,18 @@ async def create_job(request: Request, file: UploadFile = File(...)):
                 "details": [{"extension": suffix, "allowed_extensions": sorted(ALLOWED_AUDIO_EXTENSIONS)}],
             },
         )
-    if file.content_type and not file.content_type.startswith("audio/"):
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "UNSUPPORTED_MEDIA_TYPE",
-                "message": "Ожидался аудиофайл",
-                "details": [{"content_type": file.content_type}],
-            },
-        )
+    if file.content_type:
+        is_audio_mime = file.content_type.startswith("audio/")
+        is_video_container_mime = file.content_type.startswith("video/") and suffix in AUDIO_CONTAINER_EXTENSIONS
+        if not (is_audio_mime or is_video_container_mime):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "UNSUPPORTED_MEDIA_TYPE",
+                    "message": "Ожидался аудиофайл или видео-контейнер с аудиодорожкой",
+                    "details": [{"content_type": file.content_type}],
+                },
+            )
     stored_name = f"{job_id}{suffix}" if suffix else job_id
     stored_path = UPLOAD_DIR / stored_name
     total_size = 0
@@ -386,8 +432,10 @@ def list_jobs(request: Request):
             SELECT id, original_filename, status, stage, progress, status_message,
                    error, error_code, created_at, started_at, finished_at, duration_sec,
                    processing_duration_ms, transcribe_duration_ms, preprocess_duration_ms,
-                   prepared_audio_path, quality_flags, whisper_model_size,
-                   whisper_cpu_threads, whisper_beam_size
+                   decode_duration_ms, enhance_duration_ms, segment_duration_ms,
+                   decorate_duration_ms, persist_duration_ms, prepared_audio_path,
+                   quality_flags, whisper_model_size, whisper_cpu_threads, whisper_beam_size,
+                   delete_requested
             FROM transcription_jobs
             ORDER BY created_at DESC
             """
@@ -410,8 +458,10 @@ def get_job(job_id: str, request: Request):
             SELECT id, original_filename, status, stage, progress, status_message,
                    error, error_code, created_at, started_at, finished_at, duration_sec,
                    processing_duration_ms, transcribe_duration_ms, preprocess_duration_ms,
-                   prepared_audio_path, quality_flags, whisper_model_size,
-                   whisper_cpu_threads, whisper_beam_size, stored_path
+                   decode_duration_ms, enhance_duration_ms, segment_duration_ms,
+                   decorate_duration_ms, persist_duration_ms, prepared_audio_path,
+                   quality_flags, whisper_model_size, whisper_cpu_threads, whisper_beam_size,
+                   stored_path, delete_requested
             FROM transcription_jobs
             WHERE id = ?
             """,
@@ -434,7 +484,7 @@ def get_job(job_id: str, request: Request):
 
         segments = conn.execute(
             """
-            SELECT idx, start_sec, end_sec, text
+            SELECT idx, start_sec, end_sec, text, label, confidence, quality_flags
             FROM transcription_segments
             WHERE job_id = ?
             ORDER BY idx ASC
@@ -449,6 +499,9 @@ def get_job(job_id: str, request: Request):
             "start_sec": seg["start_sec"],
             "end_sec": seg["end_sec"],
             "text": seg["text"],
+            "label": seg["label"],
+            "confidence": seg["confidence"],
+            "quality_flags": seg["quality_flags"],
         }
         for seg in segments
     ]
@@ -465,12 +518,80 @@ def get_job(job_id: str, request: Request):
     return payload
 
 
-@app.get("/api/jobs/{job_id}/audio", responses={404: {"model": ErrorResponse}})
-def get_job_audio(job_id: str, request: Request):
+@app.delete("/api/jobs/{job_id}", response_model=JobDeleteResponse, responses={404: {"model": ErrorResponse}})
+def delete_job(job_id: str, request: Request):
+    request_id = getattr(request.state, "request_id", None)
     with get_connection() as conn:
         row = conn.execute(
             """
-            SELECT stored_path, original_filename
+            SELECT status, stored_path, prepared_audio_path
+            FROM transcription_jobs
+            WHERE id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "JOB_NOT_FOUND", "message": "Задача не найдена"},
+            )
+
+        if row["status"] == JobStatus.PROCESSING:
+            conn.execute(
+                """
+                UPDATE transcription_jobs
+                SET delete_requested = 1,
+                    delete_requested_at = ?,
+                    status_message = ?
+                WHERE id = ?
+                """,
+                (
+                    utc_now_iso(),
+                    "Удаление запрошено. Ожидается завершение текущего шага.",
+                    job_id,
+                ),
+            )
+            log_event(
+                logger,
+                event="job_delete_requested",
+                component="api.jobs",
+                request_id=request_id,
+                job_id=job_id,
+            )
+            return {
+                "job_id": job_id,
+                "status": "pending_delete",
+                "message": "Заявка будет удалена после завершения текущего шага обработки.",
+            }
+
+        conn.execute("DELETE FROM transcription_jobs WHERE id = ?", (job_id,))
+        _safe_unlink(row["stored_path"])
+        _safe_unlink(row["prepared_audio_path"])
+
+    log_event(
+        logger,
+        event="job_deleted",
+        component="api.jobs",
+        request_id=request_id,
+        job_id=job_id,
+    )
+    return {
+        "job_id": job_id,
+        "status": "deleted",
+        "message": "Заявка удалена.",
+    }
+
+
+@app.get("/api/jobs/{job_id}/audio", responses={404: {"model": ErrorResponse}})
+def get_job_audio(
+    job_id: str,
+    request: Request,
+    variant: str = Query(default="original", pattern="^(original|prepared)$"),
+):
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT stored_path, prepared_audio_path, original_filename
             FROM transcription_jobs
             WHERE id = ?
             """,
@@ -491,7 +612,14 @@ def get_job_audio(job_id: str, request: Request):
             detail={"code": "JOB_NOT_FOUND", "message": "Задача не найдена"},
         )
 
-    audio_path = Path(row["stored_path"])
+    raw_path = row["prepared_audio_path"] if variant == "prepared" else row["stored_path"]
+    if variant == "prepared" and not raw_path:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "PREPARED_AUDIO_NOT_FOUND", "message": "Обработанное аудио недоступно"},
+        )
+
+    audio_path = Path(raw_path)
     if not audio_path.exists() or not audio_path.is_file():
         log_event(
             logger,
@@ -516,6 +644,7 @@ def get_job_audio(job_id: str, request: Request):
         component="api.jobs",
         request_id=getattr(request.state, "request_id", None),
         job_id=job_id,
+        variant=variant,
         media_type=media_type or "application/octet-stream",
         filename=row["original_filename"] or audio_path.name,
     )
@@ -526,9 +655,116 @@ def get_job_audio(job_id: str, request: Request):
     )
 
 
+@app.get("/api/stats", response_model=JobStatsResponse)
+def get_stats(
+    request: Request,
+    from_: datetime | None = Query(default=None, alias="from"),
+    to: datetime | None = Query(default=None),
+):
+    if from_ is not None and to is not None and from_ > to:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_DATE_RANGE", "message": "Параметр from не может быть больше to"},
+        )
+    where_clauses = ["status = ?"]
+    params: list[object] = [JobStatus.DONE]
+    if from_ is not None:
+        where_clauses.append("finished_at >= ?")
+        params.append(from_.isoformat())
+    if to is not None:
+        where_clauses.append("finished_at <= ?")
+        params.append(to.isoformat())
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, original_filename, duration_sec, processing_duration_ms,
+                   preprocess_duration_ms, transcribe_duration_ms
+            FROM transcription_jobs
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY finished_at DESC
+            """,
+            params,
+        ).fetchall()
+
+    enriched: list[dict[str, object]] = []
+    for row in rows:
+        total_ms_hour = _calc_hourly_ms(row["duration_sec"], row["processing_duration_ms"])
+        preprocess_ms_hour = _calc_hourly_ms(row["duration_sec"], row["preprocess_duration_ms"])
+        transcribe_ms_hour = _calc_hourly_ms(row["duration_sec"], row["transcribe_duration_ms"])
+        if total_ms_hour is None:
+            continue
+        enriched.append(
+            {
+                "job_id": row["id"],
+                "original_filename": row["original_filename"],
+                "total_ms": total_ms_hour,
+                "preprocess_ms": preprocess_ms_hour,
+                "transcribe_ms": transcribe_ms_hour,
+            }
+        )
+
+    def to_breakdown(item: dict[str, object] | None) -> SpeedBreakdown:
+        if not item:
+            return SpeedBreakdown()
+        return SpeedBreakdown(
+            total_ms=round(float(item["total_ms"]), 2),
+            preprocess_ms=(
+                round(float(item["preprocess_ms"]), 2) if item.get("preprocess_ms") is not None else None
+            ),
+            transcribe_ms=(
+                round(float(item["transcribe_ms"]), 2) if item.get("transcribe_ms") is not None else None
+            ),
+        )
+
+    if enriched:
+        fastest = min(enriched, key=lambda item: float(item["total_ms"]))
+        slowest = max(enriched, key=lambda item: float(item["total_ms"]))
+        avg = {
+            "total_ms": _avg_or_none([float(item["total_ms"]) for item in enriched]),
+            "preprocess_ms": _avg_or_none(
+                [float(item["preprocess_ms"]) for item in enriched if item.get("preprocess_ms") is not None]
+            ),
+            "transcribe_ms": _avg_or_none(
+                [float(item["transcribe_ms"]) for item in enriched if item.get("transcribe_ms") is not None]
+            ),
+        }
+    else:
+        fastest = None
+        slowest = None
+        avg = {"total_ms": None, "preprocess_ms": None, "transcribe_ms": None}
+
+    payload = JobStatsResponse(
+        range_from=from_,
+        range_to=to,
+        completed_jobs=len(enriched),
+        average=to_breakdown(avg),
+        fastest=SpeedExtreme(
+            job_id=fastest["job_id"] if fastest else None,
+            original_filename=fastest["original_filename"] if fastest else None,
+            **to_breakdown(fastest).model_dump(),
+        ),
+        slowest=SpeedExtreme(
+            job_id=slowest["job_id"] if slowest else None,
+            original_filename=slowest["original_filename"] if slowest else None,
+            **to_breakdown(slowest).model_dump(),
+        ),
+    )
+    log_event(
+        logger,
+        event="stats_fetched",
+        component="api.jobs",
+        request_id=getattr(request.state, "request_id", None),
+        completed_jobs=payload.completed_jobs,
+    )
+    return payload
+
+
 def serialize_job_row(row) -> dict:
+    job_id = row["id"]
+    has_prepared_audio = bool(row["prepared_audio_path"])
     return {
-        "id": row["id"],
+        "id": job_id,
         "original_filename": row["original_filename"],
         "whisper_model_size": row["whisper_model_size"],
         "whisper_cpu_threads": row["whisper_cpu_threads"],
@@ -546,6 +782,13 @@ def serialize_job_row(row) -> dict:
         "processing_duration_ms": row["processing_duration_ms"],
         "transcribe_duration_ms": row["transcribe_duration_ms"],
         "preprocess_duration_ms": row["preprocess_duration_ms"],
-        "prepared_audio_path": row["prepared_audio_path"],
+        "decode_duration_ms": row["decode_duration_ms"],
+        "enhance_duration_ms": row["enhance_duration_ms"],
+        "segment_duration_ms": row["segment_duration_ms"],
+        "decorate_duration_ms": row["decorate_duration_ms"],
+        "persist_duration_ms": row["persist_duration_ms"],
+        "original_audio_url": _audio_url(job_id, "original"),
+        "prepared_audio_url": _audio_url(job_id, "prepared") if has_prepared_audio else None,
+        "delete_requested": bool(row["delete_requested"]),
         "quality_flags": row["quality_flags"],
     }

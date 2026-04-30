@@ -47,8 +47,15 @@ def init_db() -> None:
                 processing_duration_ms INTEGER,
                 transcribe_duration_ms INTEGER,
                 preprocess_duration_ms INTEGER,
+                decode_duration_ms INTEGER,
+                enhance_duration_ms INTEGER,
+                segment_duration_ms INTEGER,
+                decorate_duration_ms INTEGER,
+                persist_duration_ms INTEGER,
                 prepared_audio_path TEXT,
-                quality_flags TEXT
+                quality_flags TEXT,
+                delete_requested INTEGER NOT NULL DEFAULT 0,
+                delete_requested_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS transcription_segments (
@@ -58,6 +65,9 @@ def init_db() -> None:
                 start_sec REAL NOT NULL,
                 end_sec REAL NOT NULL,
                 text TEXT NOT NULL,
+                label TEXT,
+                confidence REAL,
+                quality_flags TEXT,
                 FOREIGN KEY(job_id) REFERENCES transcription_jobs(id) ON DELETE CASCADE
             );
 
@@ -68,7 +78,8 @@ def init_db() -> None:
             ON transcription_jobs(status, created_at);
             """
             )
-            added_columns = _ensure_job_columns(conn)
+            added_job_columns = _ensure_job_columns(conn)
+            added_segment_columns = _ensure_segment_columns(conn)
             conn.execute(
                 """
             CREATE INDEX IF NOT EXISTS idx_jobs_request_id
@@ -79,7 +90,10 @@ def init_db() -> None:
             logger,
             event="db_init_completed",
             component="db.schema",
-            added_columns=",".join(added_columns) if added_columns else None,
+            added_columns=",".join(added_job_columns) if added_job_columns else None,
+            added_segment_columns=(
+                ",".join(added_segment_columns) if added_segment_columns else None
+            ),
         )
     except sqlite3.Error as exc:
         log_event(
@@ -110,13 +124,38 @@ def _ensure_job_columns(conn: sqlite3.Connection) -> list[str]:
         ("processing_duration_ms", "INTEGER"),
         ("transcribe_duration_ms", "INTEGER"),
         ("preprocess_duration_ms", "INTEGER"),
+        ("decode_duration_ms", "INTEGER"),
+        ("enhance_duration_ms", "INTEGER"),
+        ("segment_duration_ms", "INTEGER"),
+        ("decorate_duration_ms", "INTEGER"),
+        ("persist_duration_ms", "INTEGER"),
         ("prepared_audio_path", "TEXT"),
         ("quality_flags", "TEXT"),
+        ("delete_requested", "INTEGER NOT NULL DEFAULT 0"),
+        ("delete_requested_at", "TEXT"),
     ]
     added: list[str] = []
     for name, definition in missing_columns:
         if name not in columns:
             conn.execute(f"ALTER TABLE transcription_jobs ADD COLUMN {name} {definition}")
+            added.append(name)
+    return added
+
+
+def _ensure_segment_columns(conn: sqlite3.Connection) -> list[str]:
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(transcription_segments)").fetchall()
+    }
+    missing_columns = [
+        ("label", "TEXT"),
+        ("confidence", "REAL"),
+        ("quality_flags", "TEXT"),
+    ]
+    added: list[str] = []
+    for name, definition in missing_columns:
+        if name not in columns:
+            conn.execute(f"ALTER TABLE transcription_segments ADD COLUMN {name} {definition}")
             added.append(name)
     return added
 
@@ -172,8 +211,12 @@ def requeue_unfinished_jobs() -> int:
                     started_at = NULL, finished_at = NULL,
                     duration_sec = NULL, processing_duration_ms = NULL,
                     transcribe_duration_ms = NULL, preprocess_duration_ms = NULL,
+                    decode_duration_ms = NULL, enhance_duration_ms = NULL,
+                    segment_duration_ms = NULL, decorate_duration_ms = NULL,
+                    persist_duration_ms = NULL,
                     prepared_audio_path = NULL, quality_flags = NULL,
-                    error = NULL, error_code = NULL
+                    error = NULL, error_code = NULL,
+                    delete_requested = 0, delete_requested_at = NULL
                 WHERE id = ?
                 """,
                 (

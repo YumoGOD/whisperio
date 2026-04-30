@@ -82,6 +82,27 @@ button {
   font-size: 0.9rem;
 }
 
+.tabs-card {
+  padding: 0.7rem 0.9rem;
+}
+
+.tabs {
+  display: flex;
+  gap: 0.55rem;
+}
+
+.tab-button {
+  background: var(--surface-soft);
+  color: var(--text-main);
+  border-color: var(--border);
+}
+
+.tab-button.active {
+  background: var(--primary-soft);
+  color: #1d4ed8;
+  border-color: #bfdbfe;
+}
+
 .upload-card {
   background: linear-gradient(180deg, #ffffff 0%, #fdfdff 100%);
 }
@@ -238,6 +259,7 @@ button:disabled {
   height: 100%;
   border-radius: inherit;
   background: linear-gradient(90deg, #60a5fa, var(--primary));
+  transition: width 320ms ease;
 }
 
 .status-pill {
@@ -290,6 +312,76 @@ button:disabled {
   background: var(--surface-soft);
   color: var(--text-main);
   border-color: var(--border);
+}
+
+.danger-button {
+  color: var(--danger);
+  border-color: #fecaca;
+  background: #fff5f5;
+}
+
+.audio-variant-control {
+  margin-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.audio-variant-control span {
+  color: var(--text-soft);
+  font-size: 0.9rem;
+}
+
+.audio-variant-control select {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.45rem 0.55rem;
+  background: #fff;
+}
+
+.stats-card {
+  min-height: 420px;
+}
+
+.stats-filters {
+  margin-top: 0.9rem;
+  display: flex;
+  gap: 0.85rem;
+}
+
+.stats-filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.stats-filters span {
+  color: var(--text-soft);
+  font-size: 0.87rem;
+}
+
+.stats-filters input {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.45rem 0.55rem;
+}
+
+.stats-grid {
+  margin-top: 0.95rem;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.7rem;
+}
+
+.stats-tile {
+  border: 1px solid #dbe3f1;
+  border-radius: 12px;
+  background: #fcfdff;
+  padding: 0.75rem;
+}
+
+.stats-tile p {
+  margin-top: 0.35rem;
 }
 
 .audio-player {
@@ -412,5 +504,13 @@ button:disabled {
   .topbar {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .stats-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .stats-filters {
+    flex-direction: column;
   }
 }

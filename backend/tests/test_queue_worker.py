@@ -148,12 +148,45 @@ def test_decorate_segments_skips_tagging_when_disabled(monkeypatch):
     decorated_rows, tagging_stats = worker._decorate_segments(raw_segments, "unused.wav", 3.1)
 
     assert decorated_rows == [
-        (0.0, 1.2, "первая фраза"),
-        (2.0, 3.1, "вторая фраза"),
+        {
+            "start_sec": 0.0,
+            "end_sec": 1.2,
+            "label": "unclear",
+            "text": "<Неразборчиво>",
+            "confidence": 0.1353,
+            "quality_flags": {
+                "avg_logprob": -2.0,
+                "no_speech_prob": 0.9,
+                "compression_ratio": 3.0,
+            },
+        },
+        {
+            "start_sec": 2.0,
+            "end_sec": 3.1,
+            "label": "unclear",
+            "text": "<Неразборчиво>",
+            "confidence": 0.1353,
+            "quality_flags": {
+                "avg_logprob": -2.0,
+                "no_speech_prob": 0.9,
+                "compression_ratio": 3.0,
+            },
+        },
     ]
-    assert tagging_stats["inserted_tags"] == {
-        "<Тишина>": 0,
-        "<Музыка>": 0,
-        "<Неразборчиво>": 0,
+    assert tagging_stats["inserted_labels"] == {
+        "silence": 0,
+        "music": 0,
+        "unclear": 0,
+        "speech": 0,
     }
     assert tagging_stats["gap_metrics"] == []
+
+
+def test_chunk_plan_for_long_audio(monkeypatch):
+    monkeypatch.setenv("WHISPER_LONG_AUDIO_MIN_SEC", "120")
+    monkeypatch.setenv("WHISPER_LONG_AUDIO_CHUNK_SEC", "60")
+    monkeypatch.setenv("WHISPER_LONG_AUDIO_OVERLAP_SEC", "5")
+    worker = TranscriptionWorker()
+
+    assert worker._build_chunk_plan(100.0) == [(0.0, 100.0)]
+    assert worker._build_chunk_plan(130.0) == [(0.0, 60.0), (55.0, 115.0), (110.0, 130.0)]

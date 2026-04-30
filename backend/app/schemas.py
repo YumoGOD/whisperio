@@ -11,6 +11,9 @@ class SegmentOut(BaseModel):
     start_sec: float
     end_sec: float
     text: str
+    label: str | None = None
+    confidence: float | None = None
+    quality_flags: str | None = None
 
 
 class JobBase(BaseModel):
@@ -32,7 +35,14 @@ class JobBase(BaseModel):
     processing_duration_ms: int | None = None
     transcribe_duration_ms: int | None = None
     preprocess_duration_ms: int | None = None
-    prepared_audio_path: str | None = None
+    decode_duration_ms: int | None = None
+    enhance_duration_ms: int | None = None
+    segment_duration_ms: int | None = None
+    decorate_duration_ms: int | None = None
+    persist_duration_ms: int | None = None
+    original_audio_url: str | None = None
+    prepared_audio_url: str | None = None
+    delete_requested: bool = False
     quality_flags: str | None = None
 
 
@@ -47,6 +57,32 @@ class JobListItem(JobBase):
 class JobCreateResponse(BaseModel):
     job_id: str
     status: JobStatus
+
+
+class JobDeleteResponse(BaseModel):
+    job_id: str
+    status: str
+    message: str
+
+
+class SpeedBreakdown(BaseModel):
+    total_ms: float | None = None
+    preprocess_ms: float | None = None
+    transcribe_ms: float | None = None
+
+
+class SpeedExtreme(SpeedBreakdown):
+    job_id: str | None = None
+    original_filename: str | None = None
+
+
+class JobStatsResponse(BaseModel):
+    range_from: datetime | None = None
+    range_to: datetime | None = None
+    completed_jobs: int = 0
+    average: SpeedBreakdown
+    fastest: SpeedExtreme
+    slowest: SpeedExtreme
 
 
 class ErrorResponse(BaseModel):

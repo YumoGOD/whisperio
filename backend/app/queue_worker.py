@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import subprocess
+import tempfile
 import time
 import wave
 from array import array
@@ -153,6 +154,10 @@ class QualityGuardError(RuntimeError):
 TAG_SILENCE = "<Тишина>"
 TAG_MUSIC = "<Музыка>"
 TAG_UNINTELLIGIBLE = "<Неразборчиво>"
+LABEL_SPEECH = "speech"
+LABEL_SILENCE = "silence"
+LABEL_MUSIC = "music"
+LABEL_UNCLEAR = "unclear"
 
 
 class TranscriptionWorker:
@@ -242,8 +247,23 @@ class TranscriptionWorker:
         self.max_prompt_match_ratio = getenv_float("WHISPER_MAX_PROMPT_MATCH_RATIO", 0.5)
         self.preprocess_sample_rate = getenv_int("WHISPER_PREPROCESS_SAMPLE_RATE", 16000)
         self.preprocess_timeout_sec = getenv_int("WHISPER_PREPROCESS_TIMEOUT_SEC", 1800)
+        self.enhance_profile = normalize_choice(
+            "WHISPER_ENHANCE_PROFILE",
+            os.getenv("WHISPER_ENHANCE_PROFILE", "balanced"),
+            {"off", "balanced", "aggressive"},
+            "balanced",
+        )
+        self.long_audio_min_sec = max(0, getenv_int("WHISPER_LONG_AUDIO_MIN_SEC", 3600))
+        self.long_audio_chunk_sec = max(60, getenv_int("WHISPER_LONG_AUDIO_CHUNK_SEC", 900))
+        self.long_audio_overlap_sec = max(
+            0.0,
+            min(
+                float(self.long_audio_chunk_sec - 5),
+                getenv_float("WHISPER_LONG_AUDIO_OVERLAP_SEC", 2.0),
+            ),
+        )
         self.chunk_length_s = max(1, getenv_int("WHISPER_CHUNK_LENGTH_S", 20))
-        self.keep_prepared_audio = getenv_bool("WHISPER_KEEP_PREPARED_AUDIO", False)
+        self.keep_prepared_audio = getenv_bool("WHISPER_KEEP_PREPARED_AUDIO", True)
         self.enable_tags = getenv_bool("WHISPER_ENABLE_TAGS", True)
         self.tag_silence_min_sec = max(0.0, getenv_float("WHISPER_TAG_SILENCE_MIN_SEC", 3.0))
         self.tag_silence_dbfs = getenv_float("WHISPER_TAG_SILENCE_DBFS", -38.0)
@@ -350,6 +370,55 @@ class TranscriptionWorker:
             )
         return segment_rows, info
 
+    def _probe_audio(self, audio_path: str) -> dict[str, float]:
+        command = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            str(audio_path),
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=max(30, min(self.preprocess_timeout_sec, 300)),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise AudioPreprocessError("ffprobe timed out") from exc
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout or "ffprobe failed").strip()
+            raise AudioPreprocessError(f"ffprobe failed: {details}")
+        try:
+            payload = json.loads(result.stdout or "{}")
+            duration_raw = payload.get("format", {}).get("duration")
+            duration_sec = max(0.0, float(duration_raw or 0.0))
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise AudioPreprocessError("ffprobe returned invalid metadata") from exc
+        return {"duration_sec": duration_sec}
+
+    def _build_enhance_filters(self) -> list[str]:
+        if self.enhance_profile == "off":
+            return []
+        if self.enhance_profile == "aggressive":
+            return [
+                "highpass=f=100",
+                "lowpass=f=7000",
+                "afftdn=nf=-20",
+                "dynaudnorm=f=100:g=23",
+            ]
+        return [
+            "highpass=f=80",
+            "lowpass=f=7800",
+            "afftdn=nf=-25",
+            "dynaudnorm=f=150:g=15",
+        ]
+
     def _prepare_audio(self, audio_path: str) -> str:
         source_path = Path(audio_path)
         prepared_path = source_path.with_name(f"{source_path.stem}.prepared.wav")
@@ -361,14 +430,21 @@ class TranscriptionWorker:
             "-y",
             "-i",
             str(source_path),
-            "-ac",
-            "1",
-            "-ar",
-            str(self.preprocess_sample_rate),
-            "-c:a",
-            "pcm_s16le",
-            str(prepared_path),
         ]
+        enhance_filters = self._build_enhance_filters()
+        if enhance_filters:
+            command.extend(["-af", ",".join(enhance_filters)])
+        command.extend(
+            [
+                "-ac",
+                "1",
+                "-ar",
+                str(self.preprocess_sample_rate),
+                "-c:a",
+                "pcm_s16le",
+                str(prepared_path),
+            ]
+        )
         try:
             result = subprocess.run(
                 command,
@@ -392,6 +468,41 @@ class TranscriptionWorker:
         path = Path(prepared_audio_path)
         if path.exists():
             path.unlink(missing_ok=True)
+
+    def _is_delete_requested(self, conn, job_id: str) -> bool:
+        row = conn.execute(
+            "SELECT delete_requested FROM transcription_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if not row:
+            return False
+        return bool(row["delete_requested"])
+
+    def _finalize_delete(self, job_id: str, prepared_audio_path: str | None) -> None:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT stored_path, prepared_audio_path FROM transcription_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                return
+            stored_path = row["stored_path"]
+            kept_prepared_path = row["prepared_audio_path"]
+            conn.execute("DELETE FROM transcription_jobs WHERE id = ?", (job_id,))
+
+        for candidate in (stored_path, kept_prepared_path, prepared_audio_path):
+            if candidate:
+                path = Path(candidate)
+                if path.exists() and path.is_file():
+                    path.unlink(missing_ok=True)
+
+        self._log_event(
+            event="job_deleted_after_processing_step",
+            job_id=job_id,
+            stage=JobStage.COMPLETED,
+            status=JobStatus.DONE,
+            progress=100.0,
+        )
 
     def _analyze_quality(
         self,
@@ -458,33 +569,23 @@ class TranscriptionWorker:
             "is_anomaly": bool(reasons),
         }
 
-    def _load_pcm16_audio(self, audio_path: str) -> tuple[array, int]:
-        with wave.open(audio_path, "rb") as wav_file:
-            frame_rate = wav_file.getframerate()
-            channels = wav_file.getnchannels()
-            sample_width = wav_file.getsampwidth()
-            if sample_width != 2:
-                raise AudioPreprocessError("prepared audio must be 16-bit PCM")
-            frames = wav_file.readframes(wav_file.getnframes())
-        samples = array("h")
-        samples.frombytes(frames)
-        if channels > 1:
-            mono = array("h")
-            for index in range(0, len(samples), channels):
-                mono.append(samples[index])
-            samples = mono
-        return samples, frame_rate
-
-    def _slice_samples(
+    def _read_pcm_interval(
         self,
-        samples: array,
+        wav_file: wave.Wave_read,
         sample_rate: int,
         start_sec: float,
         end_sec: float,
     ) -> array:
-        start_idx = max(0, min(int(start_sec * sample_rate), len(samples)))
-        end_idx = max(start_idx, min(int(end_sec * sample_rate), len(samples)))
-        return samples[start_idx:end_idx]
+        start_frame = max(0, int(start_sec * sample_rate))
+        end_frame = max(start_frame, int(end_sec * sample_rate))
+        frame_count = end_frame - start_frame
+        if frame_count <= 0:
+            return array("h")
+        wav_file.setpos(start_frame)
+        frames = wav_file.readframes(frame_count)
+        samples = array("h")
+        samples.frombytes(frames)
+        return samples
 
     def _audio_interval_metrics(self, interval_samples: array) -> dict[str, float]:
         sample_count = len(interval_samples)
@@ -546,110 +647,307 @@ class TranscriptionWorker:
 
     def _classify_gap(
         self,
-        samples: array,
+        wav_file: wave.Wave_read,
         sample_rate: int,
         gap_start_sec: float,
         gap_end_sec: float,
-    ) -> tuple[str, dict[str, float]] | None:
+    ) -> tuple[str, dict[str, float]]:
         gap_duration = max(0.0, gap_end_sec - gap_start_sec)
-        if gap_duration < self.tag_silence_min_sec:
-            return None
-        interval = self._slice_samples(samples, sample_rate, gap_start_sec, gap_end_sec)
+        interval = self._read_pcm_interval(wav_file, sample_rate, gap_start_sec, gap_end_sec)
         metrics = self._audio_interval_metrics(interval)
-        if metrics["rms_dbfs"] <= self.tag_silence_dbfs:
-            return TAG_SILENCE, metrics
+        if gap_duration <= 0.0:
+            return LABEL_SILENCE, metrics
+        if metrics["rms_dbfs"] <= self.tag_silence_dbfs or gap_duration < self.tag_silence_min_sec:
+            return LABEL_SILENCE, metrics
         if (
             gap_duration >= self.tag_music_min_sec
             and metrics["zcr"] <= self.tag_music_max_zcr
             and metrics["energy_variation"] <= self.tag_music_max_energy_variation
         ):
-            return TAG_MUSIC, metrics
-        return TAG_UNINTELLIGIBLE, metrics
+            return LABEL_MUSIC, metrics
+        return LABEL_UNCLEAR, metrics
+
+    def _asr_segment_to_timeline_item(
+        self,
+        start_sec: float,
+        end_sec: float,
+        segment: dict[str, float | str],
+    ) -> dict[str, object]:
+        text = str(segment.get("text", "")).strip()
+        avg_logprob = float(segment.get("avg_logprob", 0.0))
+        label = LABEL_UNCLEAR if self._is_unintelligible(segment) else LABEL_SPEECH
+        if label == LABEL_UNCLEAR:
+            text = TAG_UNINTELLIGIBLE
+        confidence = max(0.0, min(1.0, math.exp(min(0.0, avg_logprob))))
+        return {
+            "start_sec": start_sec,
+            "end_sec": end_sec,
+            "label": label,
+            "text": text,
+            "confidence": round(confidence, 4),
+            "quality_flags": {
+                "avg_logprob": round(avg_logprob, 4),
+                "no_speech_prob": round(float(segment.get("no_speech_prob", 0.0)), 4),
+                "compression_ratio": round(float(segment.get("compression_ratio", 0.0)), 4),
+            },
+        }
+
+    def _make_non_speech_segment(
+        self,
+        start_sec: float,
+        end_sec: float,
+        label: str,
+        metrics: dict[str, float],
+    ) -> dict[str, object]:
+        label_to_text = {
+            LABEL_SILENCE: TAG_SILENCE,
+            LABEL_MUSIC: TAG_MUSIC,
+            LABEL_UNCLEAR: TAG_UNINTELLIGIBLE,
+        }
+        return {
+            "start_sec": start_sec,
+            "end_sec": end_sec,
+            "label": label,
+            "text": label_to_text.get(label, TAG_UNINTELLIGIBLE),
+            "confidence": 1.0,
+            "quality_flags": {
+                "rms_dbfs": round(metrics["rms_dbfs"], 4),
+                "zcr": round(metrics["zcr"], 6),
+                "energy_variation": round(metrics["energy_variation"], 6),
+            },
+        }
+
+    def _build_chunk_plan(self, audio_duration_sec: float) -> list[tuple[float, float]]:
+        duration = max(0.0, float(audio_duration_sec))
+        if (
+            duration <= 0.0
+            or self.long_audio_chunk_sec <= 0
+            or duration < float(self.long_audio_min_sec)
+        ):
+            return [(0.0, duration)]
+        overlap = min(self.long_audio_overlap_sec, max(0.0, float(self.long_audio_chunk_sec - 5)))
+        windows: list[tuple[float, float]] = []
+        cursor = 0.0
+        while cursor < duration:
+            end_sec = min(duration, cursor + float(self.long_audio_chunk_sec))
+            windows.append((cursor, end_sec))
+            if end_sec >= duration:
+                break
+            cursor = max(0.0, end_sec - overlap)
+        return windows
+
+    def _extract_chunk(
+        self,
+        prepared_audio_path: str,
+        chunk_path: str,
+        start_sec: float,
+        end_sec: float,
+    ) -> None:
+        duration = max(0.0, end_sec - start_sec)
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            str(start_sec),
+            "-t",
+            str(duration),
+            "-i",
+            prepared_audio_path,
+            "-ac",
+            "1",
+            "-ar",
+            str(self.preprocess_sample_rate),
+            "-c:a",
+            "pcm_s16le",
+            chunk_path,
+        ]
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=max(30, min(self.preprocess_timeout_sec, 600)),
+        )
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout or "ffmpeg chunk failed").strip()
+            raise AudioPreprocessError(f"ffmpeg chunk extraction failed: {details}")
+
+    async def _transcribe_with_chunking(
+        self,
+        model: WhisperModel,
+        prepared_audio_path: str,
+        prompt: str | None,
+        condition_on_previous_text: bool,
+        audio_duration_sec: float,
+    ) -> tuple[list[dict[str, float | str]], dict[str, object]]:
+        chunk_plan = self._build_chunk_plan(audio_duration_sec)
+        if len(chunk_plan) == 1:
+            rows, info = await self._run_transcribe(
+                model,
+                prepared_audio_path,
+                prompt,
+                condition_on_previous_text,
+            )
+            return rows, {"duration": float(getattr(info, "duration", audio_duration_sec) or audio_duration_sec)}
+        merged_rows: list[dict[str, float | str]] = []
+        with tempfile.TemporaryDirectory(prefix="whisperio-chunks-") as tmp_dir:
+            for chunk_idx, (start_sec, end_sec) in enumerate(chunk_plan):
+                chunk_path = str(Path(tmp_dir) / f"chunk-{chunk_idx:04d}.wav")
+                await asyncio.to_thread(
+                    self._extract_chunk,
+                    prepared_audio_path,
+                    chunk_path,
+                    start_sec,
+                    end_sec,
+                )
+                chunk_rows, _ = await self._run_transcribe(
+                    model,
+                    chunk_path,
+                    prompt,
+                    condition_on_previous_text,
+                )
+                for row in chunk_rows:
+                    merged_rows.append(
+                        {
+                            **row,
+                            "start_sec": max(0.0, float(row["start_sec"]) + start_sec),
+                            "end_sec": max(0.0, float(row["end_sec"]) + start_sec),
+                        }
+                    )
+        merged_rows.sort(key=lambda item: (float(item["start_sec"]), float(item["end_sec"])))
+        deduped: list[dict[str, float | str]] = []
+        for row in merged_rows:
+            start_sec = max(0.0, float(row["start_sec"]))
+            end_sec = max(start_sec, float(row["end_sec"]))
+            if not deduped:
+                deduped.append({**row, "start_sec": start_sec, "end_sec": end_sec})
+                continue
+            last_end = float(deduped[-1]["end_sec"])
+            if end_sec <= last_end:
+                continue
+            if start_sec < last_end:
+                start_sec = last_end
+            deduped.append({**row, "start_sec": start_sec, "end_sec": end_sec})
+        return deduped, {"duration": audio_duration_sec}
 
     def _decorate_segments(
         self,
         raw_segments: list[dict[str, float | str]],
         audio_path: str,
         audio_duration_sec: float,
-    ) -> tuple[list[tuple[float, float, str]], dict[str, object]]:
+    ) -> tuple[list[dict[str, object]], dict[str, object]]:
         if not self.enable_tags:
-            decorated = []
+            decorated: list[dict[str, object]] = []
             for segment in raw_segments:
                 start_sec = max(0.0, float(segment["start_sec"]))
                 end_sec = max(start_sec, float(segment["end_sec"]))
                 text = str(segment.get("text", "")).strip()
                 if text:
-                    decorated.append((start_sec, end_sec, text))
+                    decorated.append(self._asr_segment_to_timeline_item(start_sec, end_sec, segment))
             return decorated, {
-                "inserted_tags": {
-                    TAG_SILENCE: 0,
-                    TAG_MUSIC: 0,
-                    TAG_UNINTELLIGIBLE: 0,
+                "inserted_labels": {
+                    LABEL_SILENCE: 0,
+                    LABEL_MUSIC: 0,
+                    LABEL_UNCLEAR: 0,
+                    LABEL_SPEECH: sum(1 for segment in decorated if segment["label"] == LABEL_SPEECH),
                 },
                 "gap_metrics": [],
             }
 
-        samples, sample_rate = self._load_pcm16_audio(audio_path)
-        decorated: list[tuple[float, float, str]] = []
-        inserted_counts = {
-            TAG_SILENCE: 0,
-            TAG_MUSIC: 0,
-            TAG_UNINTELLIGIBLE: 0,
-        }
-        gap_metrics: list[dict[str, float | str]] = []
-        previous_end = 0.0
-        for segment in raw_segments:
-            start_sec = max(0.0, float(segment["start_sec"]))
-            end_sec = max(start_sec, float(segment["end_sec"]))
-            gap_label = self._classify_gap(samples, sample_rate, previous_end, start_sec)
-            if gap_label is not None:
-                label_text, metrics = gap_label
-                decorated.append((previous_end, start_sec, label_text))
-                inserted_counts[label_text] += 1
+        with wave.open(audio_path, "rb") as wav_file:
+            sample_rate = wav_file.getframerate()
+            sample_width = wav_file.getsampwidth()
+            if sample_width != 2:
+                raise AudioPreprocessError("prepared audio must be 16-bit PCM")
+            decorated: list[dict[str, object]] = []
+            inserted_counts = {
+                LABEL_SILENCE: 0,
+                LABEL_MUSIC: 0,
+                LABEL_UNCLEAR: 0,
+                LABEL_SPEECH: 0,
+            }
+            gap_metrics: list[dict[str, float | str]] = []
+            previous_end = 0.0
+            sorted_segments = sorted(
+                raw_segments,
+                key=lambda item: (
+                    max(0.0, float(item["start_sec"])),
+                    max(0.0, float(item["end_sec"])),
+                ),
+            )
+            for segment in sorted_segments:
+                start_sec = max(0.0, float(segment["start_sec"]))
+                end_sec = max(start_sec, float(segment["end_sec"]))
+                if start_sec > previous_end:
+                    gap_label, metrics = self._classify_gap(
+                        wav_file,
+                        sample_rate,
+                        previous_end,
+                        start_sec,
+                    )
+                    decorated.append(
+                        self._make_non_speech_segment(previous_end, start_sec, gap_label, metrics)
+                    )
+                    inserted_counts[gap_label] += 1
+                    gap_metrics.append(
+                        {
+                            "start_sec": round(previous_end, 3),
+                            "end_sec": round(start_sec, 3),
+                            "label": gap_label,
+                            "rms_dbfs": round(metrics["rms_dbfs"], 4),
+                            "zcr": round(metrics["zcr"], 6),
+                            "energy_variation": round(metrics["energy_variation"], 6),
+                        }
+                    )
+                if end_sec <= previous_end:
+                    continue
+                if start_sec < previous_end:
+                    start_sec = previous_end
+                text = str(segment.get("text", "")).strip()
+                if not text:
+                    previous_end = end_sec
+                    continue
+                timeline_item = self._asr_segment_to_timeline_item(start_sec, end_sec, segment)
+                decorated.append(timeline_item)
+                inserted_counts[str(timeline_item["label"])] += 1
+                previous_end = end_sec
+
+            tail_end = max(previous_end, float(audio_duration_sec or 0.0))
+            if tail_end > previous_end:
+                tail_label, metrics = self._classify_gap(
+                    wav_file,
+                    sample_rate,
+                    previous_end,
+                    tail_end,
+                )
+                decorated.append(
+                    self._make_non_speech_segment(previous_end, tail_end, tail_label, metrics)
+                )
+                inserted_counts[tail_label] += 1
                 gap_metrics.append(
                     {
                         "start_sec": round(previous_end, 3),
-                        "end_sec": round(start_sec, 3),
-                        "label": label_text,
+                        "end_sec": round(tail_end, 3),
+                        "label": tail_label,
                         "rms_dbfs": round(metrics["rms_dbfs"], 4),
                         "zcr": round(metrics["zcr"], 6),
                         "energy_variation": round(metrics["energy_variation"], 6),
                     }
                 )
-            text = str(segment.get("text", "")).strip()
-            if not text:
-                previous_end = end_sec
-                continue
-            if self._is_unintelligible(segment):
-                decorated.append((start_sec, end_sec, TAG_UNINTELLIGIBLE))
-                inserted_counts[TAG_UNINTELLIGIBLE] += 1
-            else:
-                decorated.append((start_sec, end_sec, text))
-            previous_end = end_sec
-
-        tail_end = max(previous_end, float(audio_duration_sec or 0.0))
-        tail_label = self._classify_gap(samples, sample_rate, previous_end, tail_end)
-        if tail_label is not None:
-            label_text, metrics = tail_label
-            decorated.append((previous_end, tail_end, label_text))
-            inserted_counts[label_text] += 1
-            gap_metrics.append(
-                {
-                    "start_sec": round(previous_end, 3),
-                    "end_sec": round(tail_end, 3),
-                    "label": label_text,
-                    "rms_dbfs": round(metrics["rms_dbfs"], 4),
-                    "zcr": round(metrics["zcr"], 6),
-                    "energy_variation": round(metrics["energy_variation"], 6),
-                }
-            )
-        return decorated, {"inserted_tags": inserted_counts, "gap_metrics": gap_metrics}
+        return decorated, {"inserted_labels": inserted_counts, "gap_metrics": gap_metrics}
 
     async def _process_job(self, job_id: str) -> None:
         started_wall_time = time.perf_counter()
         prepared_audio_path: str | None = None
+        source_duration_sec: float | None = None
+        decode_duration_ms: int | None = None
         preprocess_duration_ms: int | None = None
+        enhance_duration_ms: int | None = None
         decorate_duration_ms: int | None = None
+        segment_duration_ms: int | None = None
         db_write_duration_ms: int | None = None
         quality_flags_json: str | None = None
         request_id: str | None = None
@@ -657,7 +955,7 @@ class TranscriptionWorker:
         log_context_token = bind_log_context(worker_pid=os.getpid(), job_id=job_id)
         with get_connection() as conn:
             job = conn.execute(
-                "SELECT stored_path, request_id FROM transcription_jobs WHERE id = ?",
+                "SELECT stored_path, request_id, delete_requested FROM transcription_jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
             if not job:
@@ -689,6 +987,10 @@ class TranscriptionWorker:
             )
 
         audio_path = job["stored_path"]
+        if bool(job["delete_requested"]):
+            self._finalize_delete(job_id, prepared_audio_path)
+            reset_log_context(log_context_token)
+            return
         if Path(audio_path).exists():
             audio_size_bytes = Path(audio_path).stat().st_size
         self._log_event(
@@ -709,6 +1011,10 @@ class TranscriptionWorker:
         )
         self._log_resource_snapshot(job_id=job_id, stage=JobStage.PREPARING, force=True)
         try:
+            decode_started = time.perf_counter()
+            source_probe = await asyncio.to_thread(self._probe_audio, audio_path)
+            decode_duration_ms = int((time.perf_counter() - decode_started) * 1000)
+            source_duration_sec = float(source_probe.get("duration_sec", 0.0))
             with get_connection() as conn:
                 self._update_job(
                     conn=conn,
@@ -717,6 +1023,7 @@ class TranscriptionWorker:
                     stage=JobStage.PREPROCESSING,
                     progress=10.0,
                     status_message="Подготовка аудио (mono/16kHz PCM)",
+                    decode_duration_ms=decode_duration_ms,
                 )
             preprocess_started = time.perf_counter()
             self._log_event(
@@ -729,6 +1036,7 @@ class TranscriptionWorker:
             )
             prepared_audio_path = await asyncio.to_thread(self._prepare_audio, audio_path)
             preprocess_duration_ms = int((time.perf_counter() - preprocess_started) * 1000)
+            enhance_duration_ms = preprocess_duration_ms
             with get_connection() as conn:
                 self._update_job(
                     conn=conn,
@@ -738,8 +1046,13 @@ class TranscriptionWorker:
                     progress=14.0,
                     status_message="Аудио подготовлено",
                     preprocess_duration_ms=preprocess_duration_ms,
+                    enhance_duration_ms=enhance_duration_ms,
+                    decode_duration_ms=decode_duration_ms,
                     prepared_audio_path=prepared_audio_path if self.keep_prepared_audio else None,
                 )
+                if self._is_delete_requested(conn, job_id):
+                    self._finalize_delete(job_id, prepared_audio_path)
+                    return
             self._log_event(
                 event="stage_finished",
                 job_id=job_id,
@@ -749,6 +1062,8 @@ class TranscriptionWorker:
                 duration_ms=preprocess_duration_ms,
                 extra_fields={
                     "stage_name": "preprocess",
+                    "enhance_profile": self.enhance_profile,
+                    "decode_duration_ms": decode_duration_ms,
                     "prepared_audio_file": (
                         Path(prepared_audio_path).name if prepared_audio_path else None
                     ),
@@ -774,11 +1089,12 @@ class TranscriptionWorker:
                 progress=20.0,
                 extra_fields={"stage_name": "transcribe"},
             )
-            primary_rows, info = await self._run_transcribe(
+            primary_rows, info = await self._transcribe_with_chunking(
                 model,
                 prepared_audio_path or audio_path,
                 self.initial_prompt,
                 self.condition_on_previous_text,
+                source_duration_sec or 0.0,
             )
             quality_primary = self._analyze_quality(primary_rows, self.initial_prompt)
             fallback_used = False
@@ -804,11 +1120,12 @@ class TranscriptionWorker:
                         f"quality guard failed: {','.join(quality_primary['reasons'])}"
                     )
                 fallback_used = True
-                fallback_rows, info = await self._run_transcribe(
+                fallback_rows, info = await self._transcribe_with_chunking(
                     model,
                     prepared_audio_path or audio_path,
                     None,
                     False,
+                    source_duration_sec or 0.0,
                 )
                 quality_fallback = self._analyze_quality(fallback_rows, None)
                 quality_payload["fallback_used"] = True
@@ -837,14 +1154,24 @@ class TranscriptionWorker:
                 self._decorate_segments,
                 raw_segment_rows,
                 prepared_audio_path or audio_path,
-                float(info.duration or 0.0),
+                float(info.get("duration", source_duration_sec or 0.0)),
             )
             decorate_duration_ms = int((time.perf_counter() - decorate_started) * 1000)
+            segment_duration_ms = decorate_duration_ms
             quality_payload["tagging"] = tagging_stats
             quality_flags_json = json.dumps(quality_payload, ensure_ascii=False)
             segment_rows = [
-                (job_id, idx, start_sec, end_sec, text)
-                for idx, (start_sec, end_sec, text) in enumerate(decorated_rows)
+                (
+                    job_id,
+                    idx,
+                    float(segment["start_sec"]),
+                    float(segment["end_sec"]),
+                    str(segment["text"]),
+                    str(segment["label"]),
+                    float(segment["confidence"]),
+                    json.dumps(segment["quality_flags"], ensure_ascii=False),
+                )
+                for idx, segment in enumerate(decorated_rows)
             ]
             with get_connection() as conn:
                 self._update_job(
@@ -856,9 +1183,15 @@ class TranscriptionWorker:
                     status_message=f"Сохранение сегментов: {len(segment_rows)}",
                     transcribe_duration_ms=transcribe_duration_ms,
                     preprocess_duration_ms=preprocess_duration_ms,
+                    decode_duration_ms=decode_duration_ms,
+                    enhance_duration_ms=enhance_duration_ms,
+                    segment_duration_ms=segment_duration_ms,
                     prepared_audio_path=prepared_audio_path if self.keep_prepared_audio else None,
                     quality_flags=quality_flags_json,
                 )
+                if self._is_delete_requested(conn, job_id):
+                    self._finalize_delete(job_id, prepared_audio_path)
+                    return
             self._log_event(
                 event="stage_finished",
                 job_id=job_id,
@@ -867,15 +1200,16 @@ class TranscriptionWorker:
                 progress=80.0,
                 duration_ms=transcribe_duration_ms,
                 segment_count=len(segment_rows),
-                audio_duration_sec=float(info.duration or 0.0),
+                audio_duration_sec=float(info.get("duration", source_duration_sec or 0.0)),
                 extra_fields={
                     "stage_name": "transcribe",
                     "fallback_used": fallback_used,
                     "preprocess_duration_ms": preprocess_duration_ms,
                     "decorate_duration_ms": decorate_duration_ms,
-                    "tag_silence_count": tagging_stats["inserted_tags"][TAG_SILENCE],
-                    "tag_music_count": tagging_stats["inserted_tags"][TAG_MUSIC],
-                    "tag_unintelligible_count": tagging_stats["inserted_tags"][TAG_UNINTELLIGIBLE],
+                    "tag_silence_count": tagging_stats["inserted_labels"][LABEL_SILENCE],
+                    "tag_music_count": tagging_stats["inserted_labels"][LABEL_MUSIC],
+                    "tag_unclear_count": tagging_stats["inserted_labels"][LABEL_UNCLEAR],
+                    "speech_count": tagging_stats["inserted_labels"][LABEL_SPEECH],
                 },
             )
             persist_started = time.perf_counter()
@@ -889,8 +1223,8 @@ class TranscriptionWorker:
                     conn.executemany(
                         """
                         INSERT INTO transcription_segments
-                        (job_id, idx, start_sec, end_sec, text)
-                        VALUES (?, ?, ?, ?, ?)
+                        (job_id, idx, start_sec, end_sec, text, label, confidence, quality_flags)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         segment_rows,
                     )
@@ -903,19 +1237,29 @@ class TranscriptionWorker:
                     progress=100.0,
                     status_message="Транскрибация завершена",
                     finished_at=utc_now_iso(),
-                    duration_sec=float(info.duration or 0.0),
+                    duration_sec=float(info.get("duration", source_duration_sec or 0.0)),
                     processing_duration_ms=wall_duration_ms,
                     transcribe_duration_ms=transcribe_duration_ms,
                     preprocess_duration_ms=preprocess_duration_ms,
+                    decode_duration_ms=decode_duration_ms,
+                    enhance_duration_ms=enhance_duration_ms,
+                    segment_duration_ms=segment_duration_ms,
+                    decorate_duration_ms=decorate_duration_ms,
                     prepared_audio_path=prepared_audio_path if self.keep_prepared_audio else None,
                     quality_flags=quality_flags_json,
                     clear_error=True,
                 )
             persist_duration_ms = int((time.perf_counter() - persist_started) * 1000)
             db_write_duration_ms = persist_duration_ms
+            with get_connection() as conn:
+                self._update_job(
+                    conn=conn,
+                    job_id=job_id,
+                    persist_duration_ms=persist_duration_ms,
+                )
             rtf = None
             effective_speed_x = None
-            audio_duration_sec = float(info.duration or 0.0)
+            audio_duration_sec = float(info.get("duration", source_duration_sec or 0.0))
             if audio_duration_sec > 0:
                 processing_sec = wall_duration_ms / 1000.0
                 rtf = round(processing_sec / audio_duration_sec, 6)
@@ -931,8 +1275,11 @@ class TranscriptionWorker:
                 segment_count=len(segment_rows),
                 extra_fields={
                     "preprocess_duration_ms": preprocess_duration_ms,
+                    "decode_duration_ms": decode_duration_ms,
+                    "enhance_duration_ms": enhance_duration_ms,
                     "transcribe_duration_ms": transcribe_duration_ms,
                     "decorate_duration_ms": decorate_duration_ms,
+                    "segment_duration_ms": segment_duration_ms,
                     "db_write_duration_ms": db_write_duration_ms,
                     "total_duration_ms": wall_duration_ms,
                     "audio_duration_sec": audio_duration_sec,
@@ -976,6 +1323,10 @@ class TranscriptionWorker:
                     error_code=self._infer_error_code(exc),
                     processing_duration_ms=wall_duration_ms,
                     preprocess_duration_ms=preprocess_duration_ms,
+                    decode_duration_ms=decode_duration_ms,
+                    enhance_duration_ms=enhance_duration_ms,
+                    segment_duration_ms=segment_duration_ms,
+                    decorate_duration_ms=decorate_duration_ms,
                     prepared_audio_path=prepared_audio_path if self.keep_prepared_audio else None,
                     quality_flags=quality_flags_json,
                 )
@@ -988,7 +1339,12 @@ class TranscriptionWorker:
                 duration_ms=wall_duration_ms,
                 error_code=self._infer_error_code(exc),
                 error_message=self._safe_error_message(exc),
-                extra_fields={"preprocess_duration_ms": preprocess_duration_ms},
+                extra_fields={
+                    "preprocess_duration_ms": preprocess_duration_ms,
+                    "decode_duration_ms": decode_duration_ms,
+                    "enhance_duration_ms": enhance_duration_ms,
+                    "segment_duration_ms": segment_duration_ms,
+                },
             )
         finally:
             self._cleanup_prepared_audio(prepared_audio_path)
@@ -1012,6 +1368,11 @@ class TranscriptionWorker:
         processing_duration_ms: int | None = None,
         transcribe_duration_ms: int | None = None,
         preprocess_duration_ms: int | None = None,
+        decode_duration_ms: int | None = None,
+        enhance_duration_ms: int | None = None,
+        segment_duration_ms: int | None = None,
+        decorate_duration_ms: int | None = None,
+        persist_duration_ms: int | None = None,
         prepared_audio_path: str | None = None,
         quality_flags: str | None = None,
         clear_error: bool = False,
@@ -1031,6 +1392,11 @@ class TranscriptionWorker:
             "processing_duration_ms": processing_duration_ms,
             "transcribe_duration_ms": transcribe_duration_ms,
             "preprocess_duration_ms": preprocess_duration_ms,
+            "decode_duration_ms": decode_duration_ms,
+            "enhance_duration_ms": enhance_duration_ms,
+            "segment_duration_ms": segment_duration_ms,
+            "decorate_duration_ms": decorate_duration_ms,
+            "persist_duration_ms": persist_duration_ms,
             "prepared_audio_path": prepared_audio_path,
             "quality_flags": quality_flags,
         }

@@ -14,7 +14,7 @@ services:
       # Тип вычислений: int8 ускоряет и снижает RAM, с небольшой потерей точности.
       WHISPER_COMPUTE_TYPE: int8
       # Потоки CTranslate2 на один worker-процесс.
-      WHISPER_CPU_THREADS: "12"
+      WHISPER_CPU_THREADS: "10"
       # Внутренние workers CTranslate2 внутри процесса (обычно 1 для CPU).
       WHISPER_MODEL_WORKERS: "1"
 
@@ -71,14 +71,22 @@ services:
       WHISPER_MAX_PROMPT_MATCH_RATIO: "0.5"
 
       # ==== Preprocess / runtime ====
+      # Максимальный размер загружаемого исходного файла (МБ).
+      MAX_UPLOAD_SIZE_MB: "1024"
       # Препроцессинг в mono/16kHz — стандарт для Whisper.
       WHISPER_PREPROCESS_SAMPLE_RATE: "16000"
       # Таймаут ffmpeg на подготовку.
       WHISPER_PREPROCESS_TIMEOUT_SEC: "1800"
+      # Профиль улучшения аудио: off | balanced | aggressive.
+      WHISPER_ENHANCE_PROFILE: balanced
       # Для дебага можно оставить prepared wav.
       WHISPER_KEEP_PREPARED_AUDIO: "false"
       # Длина чанка для поддерживаемых версий faster-whisper.
       WHISPER_CHUNK_LENGTH_S: "30"
+      # Внешнее чанкирование для длинных файлов.
+      WHISPER_LONG_AUDIO_MIN_SEC: "3600"
+      WHISPER_LONG_AUDIO_CHUNK_SEC: "900"
+      WHISPER_LONG_AUDIO_OVERLAP_SEC: "2.0"
 
       # ==== Parallelism ====
       # Количество отдельных worker-процессов с собственной моделью.
@@ -86,11 +94,11 @@ services:
       # Интервал опроса БД для диспетчера.
       WHISPER_DISPATCH_POLL_MS: "300"
       # Потоки math-библиотек (согласованы с WHISPER_CPU_THREADS).
-      OMP_NUM_THREADS: "15"
-      MKL_NUM_THREADS: "15"
+      OMP_NUM_THREADS: "10"
+      MKL_NUM_THREADS: "10"
       # Принудительная настройка потоков внутри subprocess-воркеров.
-      WHISPER_PROCESS_OMP_THREADS: "12"
-      WHISPER_PROCESS_MKL_THREADS: "12"
+      WHISPER_PROCESS_OMP_THREADS: "10"
+      WHISPER_PROCESS_MKL_THREADS: "10"
       # Таймаут конкурентного доступа к SQLite.
       SQLITE_BUSY_TIMEOUT_MS: "30000"
       # ==== Logging / observability ====
