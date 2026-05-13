@@ -13,7 +13,12 @@ from app.config import Settings
 from app.transcription.audio import extract_chunk, prepare_audio, probe_duration_seconds
 from app.transcription.chunking import build_chunks, merge_segments, normalize_text, replace_transcript_artifacts
 from app.transcription.exports import write_exports
-from app.transcription.glossary import GlossaryContext, apply_hard_normalization, build_glossary_context
+from app.transcription.glossary import (
+    GlossaryContext,
+    apply_hard_normalization,
+    build_glossary_context,
+    should_drop_glossary_repetition,
+)
 from app.transcription.profiles import resolve_profile
 
 logger = logging.getLogger(__name__)
@@ -253,6 +258,21 @@ class TranscriptionPipeline:
         segments: list[dict[str, Any]] = []
         for segment in segments_iter:
             text = normalize_text(segment.text)
+            compression_ratio = getattr(segment, "compression_ratio", None)
+            if should_drop_glossary_repetition(
+                text,
+                glossary_context,
+                compression_ratio,
+                self.settings.glossary_repetition_compression_threshold,
+            ):
+                logger.warning(
+                    "Сегмент пропущен как вероятная словарная галлюцинация: start=%.2f end=%.2f compression_ratio=%s text=%r",
+                    float(segment.start) + offset_seconds,
+                    float(segment.end) + offset_seconds,
+                    compression_ratio,
+                    text[:220],
+                )
+                continue
             text = apply_hard_normalization(
                 text,
                 glossary_context,
@@ -266,7 +286,7 @@ class TranscriptionPipeline:
                     "text": text,
                     "avg_logprob": getattr(segment, "avg_logprob", None),
                     "no_speech_prob": getattr(segment, "no_speech_prob", None),
-                    "compression_ratio": getattr(segment, "compression_ratio", None),
+                    "compression_ratio": compression_ratio,
                 }
             )
         return segments, info

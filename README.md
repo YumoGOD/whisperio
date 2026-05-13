@@ -74,6 +74,7 @@ Important defaults:
 - `CHUNK_OVERLAP_SECONDS=15`
 - `MAX_UPLOAD_MB=5120`
 - `GLOSSARY_PATH=/app/data/glossary/global.yml`
+- `GLOSSARY_ENABLE_HOTWORDS=false`
 - `GLOSSARY_ENABLE_HARD_NORMALIZATION=true`
 
 For a 64-core CPU server, start conservatively with `WORKER_CONCURRENCY=1` and `WHISPER_CPU_THREADS=4`, then benchmark. You can raise concurrency for multiple simultaneous jobs, or raise `WHISPER_CPU_THREADS` for a single long job if CPU utilization is low.
@@ -86,8 +87,16 @@ For a 64-core CPU server, start conservatively with `WORKER_CONCURRENCY=1` and `
 
 The global corporate glossary is stored in `./data/glossary/global.yml` and is applied to every job. It supports two modes:
 
-- `soft`: term is used in the Whisper prompt/hotwords, but the recognized text is not rewritten.
-- `hard`: term is used in the prompt/hotwords and also normalized after recognition using regex replacements.
+- `soft`: term can be used in the Whisper prompt when relevant to the job context, but the recognized text is not rewritten.
+- `hard`: term can be used in the prompt and is also normalized after recognition using regex replacements.
+
+`hotwords` are disabled by default because they can be too aggressive on long noisy Russian recordings and may cause repeated glossary hallucinations at the beginning of a chunk. Enable them only after testing a short sample:
+
+```env
+GLOSSARY_ENABLE_HOTWORDS=false
+GLOSSARY_PROMPT_MAX_CHARS=700
+GLOSSARY_REPETITION_COMPRESSION_THRESHOLD=4.0
+```
 
 Example:
 
@@ -122,7 +131,7 @@ Bauer Lounge Massage | hard | Бауэр лаундж массаж, лаундж
 Дмитрий Канищев | soft | Канищев, Дмитрий Канищев
 ```
 
-Glossary diagnostics are saved in `diagnostics.json` and shown on the job page: prompt, term counts, dynamic terms, hard replacement counts and the terms used for the job.
+Glossary diagnostics are saved in `diagnostics.json` and shown on the job page: prompt, term counts, dynamic terms, hard replacement counts, repeated glossary hallucination drops and the terms used for the job.
 
 ## Profiles
 

@@ -53,8 +53,9 @@ class Settings(BaseSettings):
     glossary_prompt_max_chars: int = 1400
     glossary_context_max_chars: int = 1200
     glossary_hotwords_max: int = 80
-    glossary_enable_hotwords: bool = True
+    glossary_enable_hotwords: bool = False
     glossary_enable_hard_normalization: bool = True
+    glossary_repetition_compression_threshold: float = 4.0
 
     @property
     def max_upload_bytes(self) -> int:

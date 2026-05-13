@@ -43,7 +43,11 @@ class GlossaryContext:
     terms: list[GlossaryTerm]
     initial_prompt: str | None
     hotwords: list[str]
+    prompted_terms: list[str] = field(default_factory=list)
     replacement_stats: ReplacementStats = field(default_factory=ReplacementStats)
+    hallucination_stats: dict[str, Any] = field(
+        default_factory=lambda: {"dropped_segments": 0, "dropped_terms": {}}
+    )
 
     def diagnostics(self) -> dict[str, Any]:
         hard_terms = [term for term in self.terms if term.mode == "hard"]
@@ -51,6 +55,7 @@ class GlossaryContext:
         return {
             "prompt": self.initial_prompt,
             "hotwords": self.hotwords,
+            "prompted_terms": self.prompted_terms,
             "terms_total": len(self.terms),
             "hard_terms": len(hard_terms),
             "soft_terms": len(soft_terms),
@@ -61,6 +66,7 @@ class GlossaryContext:
                 "total": self.replacement_stats.total,
                 "by_term": self.replacement_stats.by_term,
             },
+            "hallucination_filter": self.hallucination_stats,
         }
 
 
@@ -140,9 +146,15 @@ def build_glossary_context(settings: Settings, params: dict[str, Any]) -> Glossa
     global_terms = load_global_terms(settings.glossary_path)
     dynamic_terms = parse_dynamic_terms(params.get("dynamic_terms"))
     terms = merge_terms(dynamic_terms + global_terms)
-    prompt = build_prompt(settings, params, terms)
-    hotwords = build_hotwords(settings, terms)
-    return GlossaryContext(terms=terms, initial_prompt=prompt, hotwords=hotwords)
+    prompt_terms = select_prompt_terms(params, terms)
+    prompt = build_prompt(settings, params, prompt_terms)
+    hotwords = build_hotwords(settings, prompt_terms) if settings.glossary_enable_hotwords else []
+    return GlossaryContext(
+        terms=terms,
+        initial_prompt=prompt,
+        hotwords=hotwords,
+        prompted_terms=[term.canonical for term in prompt_terms],
+    )
 
 
 def merge_terms(terms: list[GlossaryTerm]) -> list[GlossaryTerm]:
@@ -157,9 +169,34 @@ def merge_terms(terms: list[GlossaryTerm]) -> list[GlossaryTerm]:
     return result
 
 
+def select_prompt_terms(params: dict[str, Any], terms: list[GlossaryTerm]) -> list[GlossaryTerm]:
+    context = " ".join(
+        [
+            str(params.get("audio_type") or ""),
+            str(params.get("audio_context") or ""),
+            str(params.get("expected_content") or ""),
+            str(params.get("dynamic_terms") or ""),
+        ]
+    ).casefold()
+    selected: list[GlossaryTerm] = []
+    for term in terms:
+        if term.source == "dynamic" or term.category in {"brand", "abbreviation", "person", "department"}:
+            selected.append(term)
+            continue
+        haystack = " ".join([term.canonical, term.category, *term.spoken_forms, term.description]).casefold()
+        if context and any(token and token in context for token in glossary_tokens(haystack)):
+            selected.append(term)
+    return selected
+
+
+def glossary_tokens(text: str) -> list[str]:
+    return [token for token in re.findall(r"[\wа-яА-ЯёЁ]{4,}", text.casefold()) if token]
+
+
 def build_prompt(settings: Settings, params: dict[str, Any], terms: list[GlossaryTerm]) -> str | None:
     lines = [
-        "Это русскоязычная запись. Сохраняй бренды, модели, имена, отделы, аббревиатуры и термины в указанном написании.",
+        "Это русскоязычная запись. Распознавай только то, что реально произнесено.",
+        "Если бренд, модель, имя, отдел, аббревиатура или термин действительно прозвучали, сохраняй указанное написание. Не вставляй термины из списка, если они не прозвучали.",
     ]
     audio_type = clip_text(params.get("audio_type"), 160)
     audio_context = clip_text(params.get("audio_context"), settings.glossary_context_max_chars)
@@ -173,12 +210,10 @@ def build_prompt(settings: Settings, params: dict[str, Any], terms: list[Glossar
 
     term_hints: list[str] = []
     for term in terms:
-        forms = ", ".join(term.spoken_forms[:4])
-        description = f" — {term.description}" if term.description else ""
-        if forms:
-            term_hints.append(f"{term.canonical} ({forms}){description}")
+        if term.category == "abbreviation" and term.description:
+            term_hints.append(f"{term.canonical} — {term.description}")
         else:
-            term_hints.append(f"{term.canonical}{description}")
+            term_hints.append(term.canonical)
 
     if term_hints:
         lines.append("Возможные термины и написание: " + "; ".join(term_hints))
@@ -219,6 +254,76 @@ def apply_hard_normalization(text: str, context: GlossaryContext, enabled: bool 
             normalized, count = re.subn(pattern, target, normalized, flags=re.IGNORECASE)
             context.replacement_stats.add(term.canonical, count)
     return normalized
+
+
+def should_drop_glossary_repetition(
+    text: str,
+    context: GlossaryContext,
+    compression_ratio: float | None,
+    threshold: float,
+) -> bool:
+    if not text or compression_ratio is None or compression_ratio < threshold:
+        return False
+    repeated_phrase = find_repeated_phrase(text)
+    if not repeated_phrase:
+        return False
+    if not phrase_looks_like_glossary(repeated_phrase, context):
+        return False
+    term = matched_glossary_term(repeated_phrase, context) or repeated_phrase
+    context.hallucination_stats["dropped_segments"] += 1
+    dropped_terms = context.hallucination_stats["dropped_terms"]
+    dropped_terms[term] = dropped_terms.get(term, 0) + 1
+    return True
+
+
+def find_repeated_phrase(text: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return None
+    comma_parts = [part.strip() for part in normalized.split(",") if part.strip()]
+    if len(comma_parts) >= 4:
+        counts: dict[str, int] = {}
+        originals: dict[str, str] = {}
+        for part in comma_parts:
+            key = re.sub(r"[^\wа-яА-ЯёЁ]+", " ", part.casefold()).strip()
+            counts[key] = counts.get(key, 0) + 1
+            originals.setdefault(key, part)
+        key, count = max(counts.items(), key=lambda item: item[1])
+        if count >= 4:
+            return originals[key]
+
+    words = normalized.split()
+    for size in range(2, min(7, len(words) // 3 + 1)):
+        chunks = [" ".join(words[index : index + size]) for index in range(0, len(words) - size + 1, size)]
+        if not chunks:
+            continue
+        first = re.sub(r"[^\wа-яА-ЯёЁ]+", " ", chunks[0].casefold()).strip()
+        repeats = sum(1 for chunk in chunks if re.sub(r"[^\wа-яА-ЯёЁ]+", " ", chunk.casefold()).strip() == first)
+        if repeats >= 4:
+            return chunks[0]
+    return None
+
+
+def phrase_looks_like_glossary(phrase: str, context: GlossaryContext) -> bool:
+    normalized_phrase = phrase.casefold()
+    for term in context.terms:
+        candidates = [term.canonical, *term.spoken_forms]
+        for candidate in candidates:
+            candidate_tokens = glossary_tokens(candidate)
+            if candidate.casefold() in normalized_phrase:
+                return True
+            if candidate_tokens and sum(1 for token in candidate_tokens if token in normalized_phrase) >= 1:
+                return True
+    return False
+
+
+def matched_glossary_term(phrase: str, context: GlossaryContext) -> str | None:
+    normalized_phrase = phrase.casefold()
+    for term in context.terms:
+        candidates = [term.canonical, *term.spoken_forms]
+        if any(candidate.casefold() in normalized_phrase for candidate in candidates):
+            return term.canonical
+    return None
 
 
 def generated_replacements(term: GlossaryTerm) -> list[dict[str, str]]:
