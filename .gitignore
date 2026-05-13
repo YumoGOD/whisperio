@@ -1,0 +1,56 @@
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Runtime data and generated artifacts
+data/uploads/*
+data/work/*
+data/transcripts/*
+data/logs/*
+data/models/*
+data/*.db
+data/*.db-*
+*.sqlite
+*.sqlite3
+
+!data/uploads/.gitkeep
+!data/work/.gitkeep
+!data/transcripts/.gitkeep
+!data/logs/.gitkeep
+
+# Logs
+*.log
+
+# Docker Compose local overrides
+docker-compose.override.yml
+compose.override.yml
+
+# IDE and OS files
+.vscode/
+.idea/
+.cursor/
+.DS_Store
+Thumbs.db
+desktop.ini

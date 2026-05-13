@@ -1,0 +1,1 @@
+"""Local Transcriber application package."""
