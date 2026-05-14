@@ -26,10 +26,7 @@ class Settings(BaseSettings):
 
     default_profile: Literal["accuracy_first", "speed_balanced"] = "accuracy_first"
     whisper_model: str = "large-v3"
-    whisper_device: str = "cpu"
-    whisper_compute_type: str = "int8"
-    whisper_cpu_threads: int = 4
-    whisper_num_workers: int = 1
+    whisper_compute_type: str = "float16"
     whisper_download_root: Path | None = Path("./data/models")
     whisper_language: str | None = "ru"
     whisper_task: Literal["transcribe", "translate"] = "transcribe"

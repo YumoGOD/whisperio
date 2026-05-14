@@ -36,7 +36,6 @@ def main() -> int:
         "chunk_overlap_seconds": settings.chunk_overlap_seconds,
         "model": settings.whisper_model,
         "compute_type": settings.whisper_compute_type,
-        "cpu_threads": settings.whisper_cpu_threads,
     }
     duration = probe_duration_seconds(upload_copy)
     pipeline = TranscriptionPipeline(settings)

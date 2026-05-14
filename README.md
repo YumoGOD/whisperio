@@ -1,6 +1,6 @@
 # Local Transcriber
 
-Local CPU-only app for transcribing long and noisy lecture recordings with timings. It uses FastAPI, SQLite, local files, ffmpeg and faster-whisper. No Redis, Celery, PostgreSQL, RabbitMQ or cloud service is required.
+Local app for transcribing long and noisy lecture recordings with timings. **A NVIDIA GPU is required** — the Docker image ships CUDA/cuDNN and the worker runs faster-whisper on CUDA only. Stack: FastAPI, SQLite, local files, ffmpeg, faster-whisper. No Redis, Celery, PostgreSQL, RabbitMQ or cloud service is required.
 
 ## Features
 
@@ -16,6 +16,12 @@ Local CPU-only app for transcribing long and noisy lecture recordings with timin
 - Compare `accuracy_first` and `speed_balanced` profiles.
 - Benchmark one file and print real-time factor.
 
+## GPU and Docker
+
+The [Dockerfile](Dockerfile) uses `nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04`; inference is fixed to **CUDA** in code (no CPU path). On the host you need a recent **NVIDIA driver** and the **[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)**. In [docker-compose.yml](docker-compose.yml), the `worker` service has `gpus: all`; the API service does not use a GPU.
+
+On **Windows**, use Docker Desktop with **WSL2** and GPU support in the distro; native Windows containers with GPU are limited.
+
 ## Quick Start
 
 ```bash
@@ -24,6 +30,12 @@ docker compose up --build
 ```
 
 Open `http://localhost:8000`, upload a file, and watch the job list. The first run downloads the faster-whisper model into `./data/models`, so it can be much slower than later runs.
+
+To confirm the worker sees a GPU:
+
+```bash
+docker compose run --rm worker nvidia-smi
+```
 
 If the server has restricted internet or Hugging Face SSL errors, download the model once and use it as a local path:
 
@@ -63,12 +75,10 @@ All important settings are controlled through `.env`.
 Important defaults:
 
 - `WHISPER_MODEL=large-v3`
-- `WHISPER_DEVICE=cpu`
-- `WHISPER_COMPUTE_TYPE=int8`
-- `WHISPER_CPU_THREADS=4`
+- `WHISPER_COMPUTE_TYPE=float16` (optional: `int8_float16` to reduce VRAM)
 - `WHISPER_LANGUAGE=ru`
 - `WHISPER_TASK=transcribe`
-- `WORKER_CONCURRENCY=1`
+- `WORKER_CONCURRENCY=1` (on one GPU usually leave at `1`)
 - `DEFAULT_PROFILE=accuracy_first`
 - `CHUNK_SECONDS=1800`
 - `CHUNK_OVERLAP_SECONDS=15`
@@ -77,7 +87,7 @@ Important defaults:
 - `GLOSSARY_ENABLE_HOTWORDS=false`
 - `GLOSSARY_ENABLE_HARD_NORMALIZATION=true`
 
-For a 64-core CPU server, start conservatively with `WORKER_CONCURRENCY=1` and `WHISPER_CPU_THREADS=4`, then benchmark. You can raise concurrency for multiple simultaneous jobs, or raise `WHISPER_CPU_THREADS` for a single long job if CPU utilization is low.
+Device is always **CUDA** in the application; choosing a GPU is done with `CUDA_VISIBLE_DEVICES` on the host or in Compose if needed.
 
 `WHISPER_MODEL` can be either a model alias like `large-v3` or a local CTranslate2 model directory, for example `/app/data/models/faster-whisper-large-v3`. A local path prevents runtime downloads and is recommended for offline or unstable networks.
 

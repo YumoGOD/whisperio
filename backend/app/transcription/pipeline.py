@@ -23,6 +23,9 @@ from app.transcription.profiles import resolve_profile
 
 logger = logging.getLogger(__name__)
 
+# Только NVIDIA CUDA (см. Dockerfile и docker-compose).
+_WHISPER_DEVICE = "cuda"
+
 ProgressCallback = Callable[[float, str], None]
 
 
@@ -40,19 +43,16 @@ class TranscriptionPipeline:
         if self._model is None:
             model_name = self.settings.whisper_model
             logger.info(
-                "Загрузка модели faster-whisper: model=%s device=%s compute_type=%s cpu_threads=%s",
+                "Загрузка модели faster-whisper: model=%s device=%s compute_type=%s",
                 model_name,
-                self.settings.whisper_device,
+                _WHISPER_DEVICE,
                 self.settings.whisper_compute_type,
-                self.settings.whisper_cpu_threads,
             )
             try:
                 self._model = WhisperModel(
                     model_name,
-                    device=self.settings.whisper_device,
+                    device=_WHISPER_DEVICE,
                     compute_type=self.settings.whisper_compute_type,
-                    cpu_threads=self.settings.whisper_cpu_threads,
-                    num_workers=self.settings.whisper_num_workers,
                     download_root=str(self.settings.whisper_download_root)
                     if self.settings.whisper_download_root
                     else None,
@@ -125,10 +125,8 @@ class TranscriptionPipeline:
             "chunks": [],
             "settings": {
                 "model": self.settings.whisper_model,
-                "device": self.settings.whisper_device,
+                "device": _WHISPER_DEVICE,
                 "compute_type": self.settings.whisper_compute_type,
-                "cpu_threads": self.settings.whisper_cpu_threads,
-                "num_workers": self.settings.whisper_num_workers,
                 "language": self.settings.whisper_language or None,
                 "task": self.settings.whisper_task,
                 "target_sample_rate": self.settings.target_sample_rate,

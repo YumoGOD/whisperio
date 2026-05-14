@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 python-multipart
 pydantic-settings
-faster-whisper
+faster-whisper==1.2.1
+ctranslate2==4.7.1
 PyYAML
 python-docx

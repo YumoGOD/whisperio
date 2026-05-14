@@ -19,6 +19,7 @@ services:
       - .env
     environment:
       APP_ROLE: worker
+    gpus: all
     volumes:
       - ./data:/app/data
     restart: unless-stopped

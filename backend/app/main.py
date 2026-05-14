@@ -589,10 +589,8 @@ def job_page(job_id: str) -> str:
     whisper_html = render_kv(
         [
             ("Модель", runtime_settings.get("model") or job.params.get("model") or settings.whisper_model),
-            ("Устройство", runtime_settings.get("device") or settings.whisper_device),
-            ("Compute type", runtime_settings.get("compute_type") or job.params.get("compute_type") or settings.whisper_compute_type),
-            ("CPU threads", runtime_settings.get("cpu_threads") or job.params.get("cpu_threads") or settings.whisper_cpu_threads),
-            ("Whisper num_workers", runtime_settings.get("num_workers") or settings.whisper_num_workers),
+            ("Устройство", runtime_settings.get("device") or "cuda"),
+            ("Тип вычислений", runtime_settings.get("compute_type") or job.params.get("compute_type") or settings.whisper_compute_type),
             ("Язык", runtime_settings.get("language") or job.params.get("language") or settings.whisper_language or "auto"),
             ("Задача Whisper", runtime_settings.get("task") or job.params.get("task") or settings.whisper_task),
             ("Профиль", profile_name),
@@ -910,8 +908,6 @@ def create_job(
         "chunk_overlap_seconds": settings.chunk_overlap_seconds,
         "model": settings.whisper_model,
         "compute_type": settings.whisper_compute_type,
-        "cpu_threads": settings.whisper_cpu_threads,
-        "num_workers": settings.whisper_num_workers,
         "language": settings.whisper_language,
         "task": settings.whisper_task,
         "audio_type": audio_type.strip(),
