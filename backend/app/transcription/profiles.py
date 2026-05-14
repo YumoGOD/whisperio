@@ -11,6 +11,8 @@ PROFILES: dict[str, dict[str, Any]] = {
         # Зашумлённые лекции. Приоритет — полнота, безопасность границ сегментов.
         # beam_size=5/patience=1.2 — расширенный поиск; condition_on_previous_text=False
         # предотвращает галлюцинации на границах 30-секундных окон.
+        # vad_filter=True — Silero VAD отсекает музыку/фон, предотвращая галлюцинации
+        # на немузыкальных сегментах.
         "description": "Noisy lecture profile. Prefer recall and boundary safety over speed.",
         "beam_size": 5,
         "best_of": 5,
@@ -21,7 +23,12 @@ PROFILES: dict[str, dict[str, Any]] = {
         "no_speech_threshold": 0.60,
         "condition_on_previous_text": False,
         "word_timestamps": False,
-        "vad_filter": False,
+        "vad_filter": True,
+        "vad_parameters": {
+            "threshold": 0.3,
+            "min_silence_duration_ms": 300,
+            "speech_pad_ms": 600,
+        },
     },
 }
 

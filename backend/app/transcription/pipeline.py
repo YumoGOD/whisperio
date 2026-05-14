@@ -18,6 +18,8 @@ from app.transcription.glossary import (
     GlossaryContext,
     apply_hard_normalization,
     build_glossary_context,
+    looks_like_prompt_echo,
+    should_drop_general_repetition,
     should_drop_glossary_repetition,
 )
 from app.transcription.profiles import resolve_profile
@@ -260,6 +262,27 @@ class TranscriptionPipeline:
                     float(segment.start) + offset_seconds,
                     float(segment.end) + offset_seconds,
                     compression_ratio,
+                    text[:220],
+                )
+                continue
+            if should_drop_general_repetition(
+                text,
+                compression_ratio,
+                self.settings.glossary_repetition_compression_threshold,
+            ):
+                logger.warning(
+                    "Сегмент пропущен как петля-галлюцинация: start=%.2f end=%.2f compression_ratio=%s text=%r",
+                    float(segment.start) + offset_seconds,
+                    float(segment.end) + offset_seconds,
+                    compression_ratio,
+                    text[:220],
+                )
+                continue
+            if looks_like_prompt_echo(text, glossary_context.initial_prompt):
+                logger.warning(
+                    "Сегмент пропущен как эхо промпта: start=%.2f end=%.2f text=%r",
+                    float(segment.start) + offset_seconds,
+                    float(segment.end) + offset_seconds,
                     text[:220],
                 )
                 continue

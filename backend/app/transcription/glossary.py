@@ -194,17 +194,18 @@ def glossary_tokens(text: str) -> list[str]:
 
 
 def build_prompt(settings: Settings, params: dict[str, Any], terms: list[GlossaryTerm]) -> str | None:
-    lines = ["Это русскоязычная запись. Распознавай только то, что реально произнесено."]
+    parts: list[str] = []
     audio_context = str(params.get("audio_context") or "").strip()
     expected_content = str(params.get("expected_content") or "").strip()
     if audio_context:
-        lines.append(f"Описание: {audio_context}")
+        parts.append(audio_context)
     if expected_content:
-        lines.append(f"Примерное содержание: {expected_content}")
+        parts.append(expected_content)
     if terms:
-        term_names = ", ".join(t.canonical for t in terms)
-        lines.append(f"Термины: {term_names}")
-    prompt = "\n".join(lines)
+        parts.append(", ".join(t.canonical for t in terms))
+    if not parts:
+        return None
+    prompt = ". ".join(parts)
     return clip_text(prompt, settings.glossary_prompt_max_chars) or None
 
 
@@ -260,6 +261,35 @@ def should_drop_glossary_repetition(
     dropped_terms = context.hallucination_stats["dropped_terms"]
     dropped_terms[term] = dropped_terms.get(term, 0) + 1
     return True
+
+
+def should_drop_general_repetition(text: str, compression_ratio: float | None, threshold: float) -> bool:
+    """Drop any looping hallucination regardless of whether the phrase is in the glossary."""
+    if not text or compression_ratio is None or compression_ratio < threshold:
+        return False
+    return find_repeated_phrase(text) is not None
+
+
+def looks_like_prompt_echo(text: str, initial_prompt: str | None) -> bool:
+    """True when the transcribed segment is the decoder echoing the initial_prompt back."""
+    if not initial_prompt or not text:
+        return False
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[^\wа-яёa-zA-Z0-9]", " ", s.casefold())
+
+    norm_text = " ".join(_norm(text).split())
+    norm_prompt = " ".join(_norm(initial_prompt).split())
+    text_words = norm_text.split()
+    if len(text_words) >= 3 and norm_text in norm_prompt:
+        return True
+    if len(text_words) < 8:
+        return False
+    prompt_word_set = {w for w in norm_prompt.split() if len(w) >= 4}
+    long_words = [w for w in text_words if len(w) >= 4]
+    if not long_words:
+        return False
+    return sum(1 for w in long_words if w in prompt_word_set) / len(long_words) >= 0.80
 
 
 def find_repeated_phrase(text: str) -> str | None:
