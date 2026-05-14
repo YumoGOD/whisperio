@@ -50,7 +50,8 @@ def prepare_audio(input_path: Path, output_path: Path, settings: Settings) -> Pa
     output_path.parent.mkdir(parents=True, exist_ok=True)
     filters = [f"aresample={settings.target_sample_rate}"]
     if settings.enable_loudnorm:
-        filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+        # Single-pass voice filter: removes sub-200 Hz rumble, >8 kHz noise, boosts quiet audio.
+        filters.append("highpass=f=200,lowpass=f=8000,volume=1.5")
 
     run_command(
         [
