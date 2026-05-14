@@ -1,100 +1,62 @@
-# WhisperIO: CPU-only runtime под high-throughput
+# WhisperIO
 
-Проект использует `faster-whisper` + `CTranslate2` в режиме CPU-only и рассчитан на стабильную параллельную транскрибацию.
+Приложение для одной задачи: **надежная транскрибация длинных (1-4 часа) аудио/видео файлов**, включая шумные и тихие записи.
 
-## Что изменилось в архитектуре
+## Что изменено в quality-first рефакторинге
 
-- Очередь задач стала DB-backed (`SQLite`) вместо in-memory очереди.
-- Диспетчер запускает несколько worker-процессов (`WHISPER_WORKER_PROCESSES`).
-- Каждый worker-процесс держит свой экземпляр `WhisperModel` (реальный параллельный inference).
-- При старте сервиса незавершенные `processing` задачи возвращаются в `queued`.
+- Убрана избыточная конфигурация уровня `WHISPER_*` из пользовательского потока.
+- Вынесен модульный pipeline:
+  - `backend/app/transcription/settings.py`
+  - `backend/app/transcription/preprocess.py`
+  - `backend/app/transcription/segmenter.py`
+  - `backend/app/transcription/inference.py`
+  - `backend/app/transcription/quality.py`
+  - `backend/app/transcription/pipeline.py`
+- Воркеры теперь используют `backend/app/transcription_worker.py` как тонкий оркестратор.
+- Full-file fallback заменен на **segment-level rescue** (повторная транскрибация только проблемных участков).
 
-Это убирает глобальный bottleneck "одна модель + lock на весь сервис".
+## Pipeline обработки
 
-## Рекомендованный профиль для сервера 64 cores / 128 GB RAM
+1. `ffprobe` определяет длительность.
+2. `ffmpeg` делает mono/16kHz PCM и применяет профильную предобработку:
+   - `highpass`
+   - `lowpass`
+   - `afftdn` (noise reduction)
+   - `dynaudnorm` (динамическое выравнивание громкости)
+3. VAD Cut & Merge сегментирует речь в окна около 30 секунд.
+4. Первичный проход транскрибации (`condition_on_previous_text=false`).
+5. Quality-анализ на уровне сегментов.
+6. Segment-level rescue только для низкокачественных сегментов.
+7. Сохранение финальных сегментов и метрик задачи.
 
-Базовый профиль в `docker-compose.yml`:
+## Минимальная конфигурация
 
-- `WHISPER_MODEL_SIZE=large-v3`
-- `WHISPER_COMPUTE_TYPE=int8`
-- `WHISPER_WORKER_PROCESSES=5`
-- `WHISPER_CPU_THREADS=10`
-- `OMP_NUM_THREADS=10`
-- `MKL_NUM_THREADS=10`
-- `WHISPER_BEAM_SIZE=2`
-- `WHISPER_BEST_OF=2`
+### Качество/поведение
 
-Идея профиля: accuracy-first внутри SLA (`1h -> 10-15 min`) при 4-5 параллельных файлах.
+- `TRANSCRIBE_PROFILE` — профиль обработки (`robust_long_noisy` по умолчанию, альтернативно `balanced`)
+- `TRANSCRIBE_LANGUAGE` — язык (`ru` или `auto`)
 
-## Ключевые переменные
+### Модель/железо
 
-### Параллелизм
+- `WHISPER_MODEL_SIZE` (по умолчанию `large-v3`)
+- `WHISPER_DEVICE` (`cpu`/`cuda`)
+- `WHISPER_COMPUTE_TYPE` (например `int8`, `float16`)
+- `WHISPER_CPU_THREADS`
+- `WHISPER_WORKER_PROCESSES`
 
-- `WHISPER_WORKER_PROCESSES` — количество независимых worker-процессов.
-- `WHISPER_DISPATCH_POLL_MS` — частота claim задач из БД.
-- `WHISPER_CPU_THREADS` — потоки CTranslate2 на процесс.
-- `WHISPER_MODEL_WORKERS` — внутренние worker'ы CTranslate2 (для CPU обычно `1`).
+### Операционные
 
-### Бюджет потоков (важно для стабильности)
+- `MAX_UPLOAD_SIZE_MB`
+- `DATABASE_PATH`
+- `UPLOAD_DIR`
+- `LOG_LEVEL`
 
-- `OMP_NUM_THREADS`
-- `MKL_NUM_THREADS`
-- `WHISPER_PROCESS_OMP_THREADS`
-- `WHISPER_PROCESS_MKL_THREADS`
+Остальные параметры теперь внутренние и задаются profile-presets.
 
-Рекомендуется держать их согласованными с `WHISPER_CPU_THREADS`, чтобы избежать oversubscription.
+## Профили
 
-### Декодер и качество
-
-- `WHISPER_BEAM_SIZE`, `WHISPER_BEST_OF` — рост качества ценой времени.
-- `WHISPER_TEMPERATURE` — для детерминизма обычно `0.0`.
-- `WHISPER_CONDITION_ON_PREVIOUS_TEXT` — связность текста, небольшой overhead.
-- `WHISPER_ENABLE_QUALITY_FALLBACK` — повторный проход только при аномалиях.
-
-### VAD и сегментация
-
-- `WHISPER_VAD_FILTER`, `WHISPER_VAD_*`
-- `WHISPER_NO_SPEECH_THRESHOLD`
-- `WHISPER_LOG_PROB_THRESHOLD`
-- `WHISPER_COMPRESSION_RATIO_THRESHOLD`
-
-## Компромиссные профили
-
-- **Accuracy-first (текущий по умолчанию):**
-  - `large-v3`, `int8`, `beam=2`, `best_of=2`.
-- **Balanced:**
-  - `large-v3`, `int8`, `beam=1`, `best_of=1`.
-- **SLA-peak (в пиковую нагрузку):**
-  - `medium`, `int8`, `beam=1`, `best_of=1`.
-
-## Runbook: калибровка под SLA
-
-1. Запустите систему:
-   ```bash
-   docker compose up --build
-   ```
-2. Подготовьте набор из 5 файлов длительностью 45-60 минут.
-3. Выполните 3-4 прогона с разными профилями:
-   - `beam/best_of`: `2/2`, `3/3`, `1/1`
-   - `worker_processes x cpu_threads`: `5x10`, `4x12`, `6x8`
-4. Фиксируйте по каждому прогону:
-   - `p95 processing_duration_ms`
-   - `transcribe_duration_ms`
-   - долю fallback-проходов из `quality_flags`
-   - прокси качества на контрольном наборе
-5. Зафиксируйте профиль, который укладывается в SLA и дает лучшее качество.
-
-Для автоматизации прогона можно использовать утилиту:
-
-```bash
-python backend/scripts/benchmark_matrix.py --files /path/a.wav /path/b.wav /path/c.wav /path/d.wav /path/e.wav --parallel 5 --out benchmark-results.json
-```
-
-## Метрики приемки
-
-- `p95 <= 15 min` на `1 hour` аудио.
-- Стабильная обработка 4-5 файлов параллельно.
-- Нет падений worker-процессов и ошибок конкурентной записи в БД.
+- `robust_long_noisy` — для плохого качества речи, шума и длинных файлов.
+- `balanced` — более быстрый и менее агрессивный по rescue.
 
 ## Запуск
 
@@ -102,61 +64,23 @@ python backend/scripts/benchmark_matrix.py --files /path/a.wav /path/b.wav /path
 docker compose up --build
 ```
 
-Backend API: `http://localhost:8000`  
-Frontend: `http://localhost:3000`
+- Backend API: `http://localhost:8000`
+- Frontend: `http://localhost:3000`
 
-## Примечание про версию faster-whisper
+## Benchmark
 
-`WHISPER_CHUNK_LENGTH_S` применяется только если текущая версия `faster-whisper` поддерживает аргумент `chunk_length`.
-
-## Логирование и диагностика нагрузки
-
-Сервис пишет структурированные JSON-логи в stdout. По умолчанию включены:
-
-- lifecycle API-запроса (`api_request_started`, `api_request_finished`);
-- lifecycle job (`job_created`, `job_claimed`, `job_dispatched`, `job_completed`, `job_failed`);
-- stage telemetry (`stage_started`, `stage_finished`, `stage_failed`);
-- runtime snapshots (`runtime_snapshot`);
-- worker resource snapshots (`worker_resource_snapshot`, `resource_pressure_warning`);
-- SLA diagnostics (`sla_drift_detected`).
-
-### Обязательные поля в логах
-
-- `ts`, `level`, `event`, `service`, `component`, `schema_version`, `logger`;
-- correlation-поля: `request_id`, `job_id`, `worker_pid`;
-- performance-поля (по контексту): `duration_ms`, `preprocess_duration_ms`, `transcribe_duration_ms`, `rtf`, `effective_speed_x`, `queue_backlog`.
-
-### Переменные окружения для логов
-
-- `LOG_FORMAT` (`json` или `text`);
-- `LOG_LEVEL` (`INFO`, `DEBUG`, ...);
-- `LOG_SERVICE_NAME`;
-- `LOG_SNAPSHOT_INTERVAL_SEC`;
-- `LOG_RESOURCE_RSS_WARN_MB`;
-- `WHISPER_SLA_RTF_THRESHOLD`.
-
-### Быстрый анализ через jq
-
-Ошибки pipeline:
+Скрипт нагрузочного прогона:
 
 ```bash
-docker compose logs backend | jq -c 'select(.event=="job_failed" or .event=="stage_failed")'
+python backend/scripts/benchmark_matrix.py --files /path/a.wav /path/b.wav --parallel 2 --repeat 1 --profile-name robust_long_noisy --out benchmark-results.json
 ```
 
-SLA drift и причины:
+Отчет сохраняет `processing_rtf`, `effective_speed_x`, статусы и `quality_flags`.
 
-```bash
-docker compose logs backend | jq -c 'select(.event=="sla_drift_detected") | {ts,job_id,reason_code,rtf,queue_backlog}'
-```
+## API (кратко)
 
-Runtime load snapshots:
-
-```bash
-docker compose logs backend | jq -c 'select(.event=="runtime_snapshot") | {ts,in_flight,queue_backlog,claimed_per_min,completed_per_min,failed_per_min,loop_lag_ms}'
-```
-
-Высокое потребление памяти воркерами:
-
-```bash
-docker compose logs backend | jq -c 'select(.event=="resource_pressure_warning") | {ts,worker_pid,rss_bytes,rss_warn_mb,job_id}'
-```
+- `POST /api/jobs` — загрузить файл
+- `GET /api/jobs` — список задач
+- `GET /api/jobs/{job_id}` — детали + сегменты
+- `DELETE /api/jobs/{job_id}` — удалить задачу
+- `GET /api/jobs/{job_id}/audio?variant=original|prepared` — скачать аудио

@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from app.db import get_connection, init_db, requeue_unfinished_jobs
 from app.logging_utils import bind_log_context, configure_logging, log_event, reset_log_context
 from app.models import JobStage, JobStatus
-from app.queue_worker import utc_now_iso
+from app.transcription_worker import utc_now_iso
 from app.runtime import TranscriptionRuntime
 from app.schemas import (
     ErrorResponse,
@@ -60,19 +60,6 @@ AUDIO_MEDIA_TYPES = {
     ".mov": "video/quicktime",
     ".webm": "audio/webm",
 }
-
-DEFAULT_WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "medium")
-
-
-def env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-
-
-DEFAULT_WHISPER_CPU_THREADS = max(1, env_int("WHISPER_CPU_THREADS", 12))
-DEFAULT_WHISPER_BEAM_SIZE = max(1, env_int("WHISPER_BEAM_SIZE", 1))
 
 runtime = TranscriptionRuntime()
 
@@ -388,9 +375,8 @@ async def create_job(request: Request, file: UploadFile = File(...)):
             """
             INSERT INTO transcription_jobs (
                 id, request_id, original_filename, stored_path, status, stage, progress,
-                status_message, created_at, whisper_model_size, whisper_cpu_threads,
-                whisper_beam_size
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status_message, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -402,9 +388,6 @@ async def create_job(request: Request, file: UploadFile = File(...)):
                 0.0,
                 "Ожидает обработки",
                 created_at,
-                DEFAULT_WHISPER_MODEL_SIZE,
-                DEFAULT_WHISPER_CPU_THREADS,
-                DEFAULT_WHISPER_BEAM_SIZE,
             ),
         )
 
@@ -432,10 +415,7 @@ def list_jobs(request: Request):
             SELECT id, original_filename, status, stage, progress, status_message,
                    error, error_code, created_at, started_at, finished_at, duration_sec,
                    processing_duration_ms, transcribe_duration_ms, preprocess_duration_ms,
-                   decode_duration_ms, enhance_duration_ms, segment_duration_ms,
-                   decorate_duration_ms, persist_duration_ms, prepared_audio_path,
-                   quality_flags, whisper_model_size, whisper_cpu_threads, whisper_beam_size,
-                   delete_requested
+                   prepared_audio_path, quality_flags, delete_requested
             FROM transcription_jobs
             ORDER BY created_at DESC
             """
@@ -458,10 +438,7 @@ def get_job(job_id: str, request: Request):
             SELECT id, original_filename, status, stage, progress, status_message,
                    error, error_code, created_at, started_at, finished_at, duration_sec,
                    processing_duration_ms, transcribe_duration_ms, preprocess_duration_ms,
-                   decode_duration_ms, enhance_duration_ms, segment_duration_ms,
-                   decorate_duration_ms, persist_duration_ms, prepared_audio_path,
-                   quality_flags, whisper_model_size, whisper_cpu_threads, whisper_beam_size,
-                   stored_path, delete_requested
+                   prepared_audio_path, quality_flags, stored_path, delete_requested
             FROM transcription_jobs
             WHERE id = ?
             """,
@@ -766,9 +743,6 @@ def serialize_job_row(row) -> dict:
     return {
         "id": job_id,
         "original_filename": row["original_filename"],
-        "whisper_model_size": row["whisper_model_size"],
-        "whisper_cpu_threads": row["whisper_cpu_threads"],
-        "whisper_beam_size": row["whisper_beam_size"],
         "status": row["status"],
         "stage": row["stage"],
         "progress": row["progress"],
@@ -782,11 +756,6 @@ def serialize_job_row(row) -> dict:
         "processing_duration_ms": row["processing_duration_ms"],
         "transcribe_duration_ms": row["transcribe_duration_ms"],
         "preprocess_duration_ms": row["preprocess_duration_ms"],
-        "decode_duration_ms": row["decode_duration_ms"],
-        "enhance_duration_ms": row["enhance_duration_ms"],
-        "segment_duration_ms": row["segment_duration_ms"],
-        "decorate_duration_ms": row["decorate_duration_ms"],
-        "persist_duration_ms": row["persist_duration_ms"],
         "original_audio_url": _audio_url(job_id, "original"),
         "prepared_audio_url": _audio_url(job_id, "prepared") if has_prepared_audio else None,
         "delete_requested": bool(row["delete_requested"]),

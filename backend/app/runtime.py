@@ -8,7 +8,7 @@ from typing import Any
 
 from app.db import claim_next_job, get_queue_stats
 from app.logging_utils import bind_log_context, configure_logging, log_event, reset_log_context
-from app.queue_worker import TranscriptionWorker
+from app.transcription_worker import TranscriptionWorker
 
 logger = logging.getLogger("whisperio.runtime")
 

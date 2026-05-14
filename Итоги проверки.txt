@@ -1,0 +1,200 @@
+Итоги проверки WhisperIO
+Дата проверки: 10 мая 2026
+
+1. Общий отзыв
+
+Что работает хорошо:
+- Приложение построено вокруг понятной задачи: надежная транскрибация длинных аудио/видео файлов, включая шумные и тихие записи.
+- Активная архитектура выглядит осмысленно: FastAPI принимает файл и создает задачу, SQLite хранит очередь и результаты, runtime раздает задачи в отдельные процессы, worker запускает подготовку аудио и quality-first pipeline.
+- Новый модульный pipeline в backend/app/transcription лучше старого монолитного подхода: отдельно вынесены settings, preprocess, segmenter, inference, quality и pipeline.
+- Для Whisper выбран правильный базовый путь: mono 16 kHz PCM, внешняя VAD-сегментация, transcribe через faster-whisper, отдельная rescue-логика для проблемных участков.
+- Есть нормальная эксплуатационная база: структурированные логи, request_id, статусы и стадии задач, прогресс, SQLite WAL, busy_timeout, восстановление PROCESSING-задач при старте.
+- Frontend и API в целом согласованы: загрузка, список задач, детали, удаление, аудио original/prepared и экспорт Word работают по понятному контракту.
+
+Что работает плохо или рискованно:
+- В проекте одновременно видны следы старой и новой реализации. Особенно плохо выглядит backend/app/queue_worker.py: активный код там почти только re-export, а дальше лежит огромный raw string со старым worker-кодом. Это путает ревью, поддержку и поиск по коду.
+- Текущий профиль оптимизирован под качество, но может быть тяжелым для CPU: large-v3 + int8 + 2 процесса + 10 CPU threads на процесс легко перегружают машину по CPU/RAM.
+- Для очень длинных файлов VAD сейчас декодирует весь подготовленный аудиофайл в память. Для 1-4 часов это может быть узким местом.
+- Нет полноценного end-to-end контроля качества на реальных аудио: есть юнит-тесты на VAD/rescue/API-части, но не хватает интеграционных прогонов с эталонными файлами, WER/CER, latency/RTF и регрессиями по качеству.
+
+Общий вывод:
+Проект уже имеет хорошую основу для локального инструмента транскрибации. Самая сильная часть - переход к quality-first pipeline с VAD-окнами и segment-level rescue. Главные риски - эксплуатационная тяжесть на CPU, память на длинных файлах, агрессивность предобработки для всех типов записей и технический долг от старого кода.
+
+
+2. Как написан код
+
+Что хорошо:
+- Backend разложен по зонам ответственности: app/main.py отвечает за API, app/runtime.py за диспетчеризацию, app/db.py за SQLite, app/transcription_worker.py за orchestration, app/transcription/* за сам ASR pipeline.
+- Используются dataclass-настройки для DecodeSettings, VadSettings, QualitySettings, PreprocessSettings и TranscriptionSettings. Это лучше, чем россыпь env-переменных по всему worker.
+- API аккуратно обрабатывает ошибки: есть единый ErrorResponse, обработчики HTTPException, RequestValidationError и unexpected exception.
+- Загрузка файла идет потоково чанками, с ограничением размера, без чтения всего upload в память.
+- SQLite-очередь реализована достаточно надежно: claim_next_job использует BEGIN IMMEDIATE и условный UPDATE по статусу queued, что снижает риск двойного захвата.
+- Worker сериализует вызовы одной модели через _transcribe_lock. Для faster-whisper это разумно, если один WhisperModel используется внутри процесса.
+- Есть полезные runtime-логи: job_claimed, job_dispatched, runtime_snapshot, job_completed, resource_snapshot.
+- Frontend-код простой и рабочий: отдельный api.js, retry для transient read/delete ошибок, polling, отображение стадий, экспорт результата в docx.
+
+Что плохо:
+- backend/app/queue_worker.py содержит тысячи строк старого кода внутри строки. Это не исполняется, но создает шум, мешает поиску, может вводить разработчика в заблуждение и ухудшает качество проекта.
+- В backend/tests/test_queue_worker.py также есть большой блок legacy-тестов, отключенный через многострочную строку. Это выглядит как незавершенный рефакторинг.
+- В app/runtime.py env-переменные WHISPER_WORKER_PROCESSES, WHISPER_DISPATCH_POLL_MS и LOG_SNAPSHOT_INTERVAL_SEC парсятся через int(os.getenv(...)). При некорректном значении приложение может упасть на старте.
+- В app/transcription/settings.py invalid TRANSCRIBE_PROFILE просто заменяется на default без явного предупреждения в логах.
+- app/main.py достаточно большой: API, сериализация, статистика, upload, delete, audio serving и error builders лежат в одном файле. Пока это терпимо, но файл уже тянет на разбиение.
+- upload и запись job в БД не атомарны: файл может быть записан, а INSERT в SQLite может упасть, оставив orphan-файл.
+- CORS сейчас allow_origins=["*"]. Для локального инструмента это удобно, для реального deployment лучше ограничить origins.
+- Схемы возвращают quality_flags как строку с JSON. Это работает, но хуже для frontend и API-контракта, чем structured object.
+
+Что улучшить:
+- Удалить legacy raw string из backend/app/queue_worker.py или заменить файл коротким compatibility shim с комментарием. Историю должен хранить git, не исходник.
+- Удалить или восстановить отключенные legacy-тесты. Если старая логика больше не нужна, тесты лучше убрать, а важные сценарии перенести на новый pipeline.
+- Вынести безопасные env-парсеры в общий модуль и использовать их в runtime.py, settings.py, db.py, main.py.
+- Разделить main.py на routes/jobs.py, routes/stats.py, routes/audio.py и serializers.py, если проект будет расти.
+- Сделать upload через временный .part-файл с rename после успешной записи и cleanup при ошибке DB.
+- Возвращать quality_flags как JSON object в API или добавить отдельное parsed_quality поле.
+- Добавить тесты на runtime dispatcher, crash/requeue, upload API через TestClient и ошибки ffmpeg/ffprobe.
+
+
+3. Предобработка аудио
+
+Что работает хорошо:
+- Приведение к mono 16 kHz PCM s16le - правильное и стандартное решение для Whisper/faster-whisper.
+- Использование ffmpeg перед моделью оправдано для пользовательских аудио/видео: можно принимать mp3, wav, m4a, ogg, flac, aac и видео-контейнеры.
+- Профиль robust_long_noisy содержит полезные для речи фильтры: highpass, lowpass, afftdn, dynaudnorm, alimiter.
+- highpass убирает низкочастотный гул, lowpass отсекает лишний верх, afftdn снижает шум, dynaudnorm выравнивает тихую/громкую речь.
+- keep_prepared_audio=true полезен для диагностики: можно сравнить оригинал и обработанный файл во frontend.
+
+Что плохо или рискованно:
+- Предобработка всегда применяется профилем целиком. Для плохих записей это полезно, но для чистой студийной речи, музыки на фоне, широкополосного контента или уже обработанного аудио фильтры могут ухудшить качество.
+- dynaudnorm и denoise могут поднять шумы пауз, изменить тембр, подавить тихие согласные или создать артефакты, которые Whisper воспримет как речь.
+- Нет автоматической оценки аудио до применения фильтров: не измеряются loudness, SNR, clipping, доля тишины, DC offset, уровень шума.
+- ffprobe использует тот же timeout_sec, что и preprocessing. При WHISPER_PREPROCESS_TIMEOUT_SEC=1800 metadata probe теоретически может ждать слишком долго.
+- Нет fallback-профиля при ошибке фильтров ffmpeg. Если afftdn/dynaudnorm/alimiter не поддерживаются конкретной сборкой ffmpeg, задача упадет на этапе подготовки.
+- prepare_audio пишет prepared-файл рядом с source по stem.prepared.wav. При текущем UUID-имени upload это нормально, но паттерн хрупкий, если когда-нибудь изменится схема хранения.
+
+Оценка качества предобработки:
+Для целевого сценария "длинные шумные русскоязычные записи" предобработка в целом хорошая. Она speech-oriented и повышает шанс получить разборчивую речь на плохих файлах. Но как универсальный default она довольно агрессивна. Лучше воспринимать robust_long_noisy как режим для сложных записей, а balanced или более мягкий профиль - как default для нормального аудио.
+
+Что улучшить:
+- Разделить timeout для ffprobe и ffmpeg: например WHISPER_PROBE_TIMEOUT_SEC=60, WHISPER_PREPROCESS_TIMEOUT_SEC для полной перекодировки.
+- Добавить профиль clean или light: только mono/16kHz, возможно highpass без denoise/dynaudnorm.
+- Добавить автоматический выбор профиля на основе простых метрик ffmpeg/ffprobe: peak/RMS/loudness, clipping, silence ratio.
+- Логировать примененный filter chain в quality_flags или отдельное поле job metrics.
+- Добавить fallback: если ffmpeg с фильтрами упал, попробовать подготовку без фильтров и явно пометить это в quality_flags.
+- Для критичных кейсов провести benchmark на реальных файлах: original vs balanced vs robust_long_noisy с ручной оценкой/WER.
+
+
+4. Процесс транскрибации
+
+Что работает хорошо:
+- Подход "external VAD -> clip_timestamps -> faster-whisper" хороший. Он избегает двойной VAD, потому что в transcribe_windows vad_filter=False.
+- VAD Cut & Merge режет аудио на речевые окна примерно до 30 секунд. Это соответствует природе Whisper, который лучше работает на ограниченных фрагментах, чем на хаотичных длинных кусках.
+- condition_on_previous_text=False для primary и rescue - разумный выбор для независимых VAD-окон. Это снижает риск накопления галлюцинаций и повторов между окнами.
+- Segment-level rescue лучше, чем полный fallback всего файла: повторно распознаются только проблемные участки, что экономит время и снижает риск перегенерации хороших мест.
+- Rescue использует более сильные decode settings: beam_size/best_of выше, thresholds мягче. Это логично для сложных фрагментов.
+- К каждому сегменту добавляются confidence и quality_flags по avg_logprob, no_speech_prob, compression_ratio.
+- Pipeline сохраняет метрики: vad_window_count, rescue_window_count, rescue_applied_count, rescue_reason_counts, tagging.
+
+Что плохо или рискованно:
+- VAD загружает весь аудиофайл через faster_whisper.audio.decode_audio. Для 1-4 часов это может стать проблемой RAM, особенно при нескольких процессах.
+- Если VAD ошибся и вернул слишком широкие или слишком узкие окна, модель будет работать только с этими окнами. Fail-open на полный файл есть при исключении/пустом VAD, но нет тонкой проверки качества VAD-разметки.
+- replace_rows_in_window удаляет все сегменты, которые пересекаются с rescue window, и вставляет rescue rows. Из-за padding можно удалить хороший сегмент, который только частично попал в окно.
+- rescue_max_segments ограничивает число rescue-окон. Если плохих участков много, хвост файла может остаться без rescue.
+- В новом активном pipeline нет global quality guard на весь текст: не проверяются массовые повторы, prompt-hallucination, однотипные фразы по всему файлу. В legacy-коде такая логика была, но в новом pipeline она не перенесена.
+- active pipeline не использует initial_prompt/domain vocabulary. Для специализированных терминов, имен, брендов и профессионального жаргона это может снижать качество.
+- Нет постобработки текста: пунктуация берется как есть от Whisper, нет нормализации пробелов, объединения коротких сегментов по смыслу, удаления дублей вне rescue-boundary.
+
+Оценка подхода:
+Для faster-whisper текущий процесс транскрибации в целом хороший и современный. Он лучше классического "прогнать весь длинный файл одним куском" и лучше грубого chunking без VAD. Самая сильная идея - локальный rescue вместо полной перетранскрибации. Но для production-качества длинных файлов нужно добавить контроль памяти, глобальную проверку качества и более осторожную замену сегментов при rescue.
+
+Что улучшить:
+- Реализовать chunked/streamed VAD для длинных файлов, чтобы не держать весь waveform в RAM.
+- Добавить глобальный quality analysis после primary/rescue: доля повторов, near-duplicates, слишком частые одинаковые фразы, аномально пустой текст, подозрительно короткий transcript относительно duration.
+- Сделать rescue replacement аккуратнее: split/trim пересекающиеся сегменты вместо удаления всех overlaps.
+- Добавить initial_prompt в DecodeSettings и transcribe_windows, но использовать осторожно: prompt должен помогать терминологии, а не провоцировать повторы.
+- Добавить опциональную финальную дедупликацию соседних похожих сегментов.
+- Добавить benchmark_matrix не только по скорости, но и по качеству: WER/CER на наборе эталонных файлов.
+
+
+5. Настройки
+
+Что хорошо:
+- Конфигурация стала проще: пользовательский слой сведен к TRANSCRIBE_PROFILE, TRANSCRIBE_LANGUAGE, WHISPER_MODEL_SIZE, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE, WHISPER_CPU_THREADS, WHISPER_WORKER_PROCESSES и операционным переменным.
+- Профили robust_long_noisy и balanced объединяют связанные параметры: preprocess filters, VAD, decode и quality thresholds. Это лучше, чем десятки независимых WHISPER_* knobs.
+- TRANSCRIBE_LANGUAGE=ru подходит, если основной сценарий - русская речь. Это быстрее и стабильнее, чем auto, когда язык заранее известен.
+- WHISPER_COMPUTE_TYPE=int8 на CPU - разумный компромисс для large-v3, иначе CPU-инференс был бы слишком тяжелым.
+- WHISPER_KEEP_PREPARED_AUDIO=true полезен на этапе отладки и аудита качества.
+- MAX_UPLOAD_SIZE_MB=10240 подходит для 1-4 часовых видео/аудио, если диск действительно рассчитан на такие файлы.
+
+Что плохо или рискованно:
+- WHISPER_MODEL_SIZE=large-v3 + WHISPER_DEVICE=cpu + WHISPER_WORKER_PROCESSES=2 + WHISPER_CPU_THREADS=10 может быть слишком тяжелой комбинацией. В худшем случае это 2 процесса, каждый держит свою модель и активно использует CPU threads.
+- WHISPER_WORKER_PROCESSES=2 на CPU с large-v3 может дать не ускорение, а конкуренцию за RAM/cache/ядра и просадку RTF.
+- LOG_RESOURCE_RSS_WARN_MB=12288 выглядит высоким порогом. Если машина имеет 16 GB RAM, предупреждение может прийти слишком поздно.
+- robust_long_noisy как default хорош для плохого аудио, но избыточен для чистых записей.
+- WHISPER_KEEP_PREPARED_AUDIO=true удваивает хранение аудио: оригинал + prepared wav. При MAX_UPLOAD_SIZE_MB=10240 диск может быстро заполниться.
+- WHISPER_SLA_RTF_THRESHOLD=0.25 означает ожидание обработки быстрее 4x realtime. На CPU с large-v3 это может быть слишком оптимистично, особенно при rescue и длинных файлах.
+- SQLITE_BUSY_TIMEOUT_MS=30000 нормально для небольшой локальной очереди, но SQLite не идеален для многопроцессной тяжелой очереди при росте нагрузки.
+
+Рекомендации по настройкам:
+- Если главное качество и есть мощный CPU/RAM: оставить large-v3/int8, но начать с WHISPER_WORKER_PROCESSES=1 и WHISPER_CPU_THREADS примерно равным числу физических ядер или чуть меньше. Потом повышать процессы только по benchmark.
+- Если важна скорость на CPU: протестировать medium или large-v3-turbo, если он поддерживается используемой faster-whisper/CTranslate2 связкой.
+- Если есть NVIDIA GPU: перейти на WHISPER_DEVICE=cuda и WHISPER_COMPUTE_TYPE=float16, а процессы держать осторожно, часто 1 процесс на GPU надежнее.
+- Для обычных чистых записей попробовать TRANSCRIBE_PROFILE=balanced или добавить clean/light профиль.
+- Если диск важнее диагностики, поставить WHISPER_KEEP_PREPARED_AUDIO=false после завершения периода отладки.
+- Понизить LOG_RESOURCE_RSS_WARN_MB под реальную машину: например 70-80% доступной RAM.
+- Добавить явное логирование финальных effective settings на старте runtime и worker.
+- Добавить предупреждение, если WHISPER_WORKER_PROCESSES * WHISPER_CPU_THREADS явно превышает число доступных CPU.
+
+
+6. Общее качество проекта
+
+Что хорошо:
+- Проект уже выглядит как цельное приложение, а не просто скрипт: есть backend, frontend, docker-compose, README, API, очередь, хранение результатов и экспорт.
+- README хорошо описывает назначение, pipeline, профили, запуск и benchmark.
+- Docker-compose простой и понятный: backend, frontend, shared data volume.
+- Есть базовые тесты на настройки, VAD windows, fallback VAD, rescue, serialized transcribe calls, delete и stats.
+- В frontend есть полезные функции для оператора: список задач, прогресс, стадии, удаление, прослушивание original/prepared, переход по сегменту, экспорт в Word.
+- Логирование продумано: JSON logs, rotating file, sanitization sensitive fields, request context.
+
+Что плохо:
+- Нет полноценной системы оценки качества транскрибации. Для Whisper-инструмента это критично: без набора эталонных файлов сложно понять, улучшили ли изменения качество или только изменили параметры.
+- Нет CI-конфигурации, линтера/форматтера в явном виде, pyproject.toml или pinned backend dependencies кроме faster-whisper.
+- backend/requirements.txt почти не фиксирует версии FastAPI/Uvicorn/psutil. Это повышает риск неожиданных изменений при rebuild.
+- Нет health/readiness проверки ffmpeg, ffprobe, модели и прав на директории data.
+- Нет политики очистки старых jobs/files/logs/prepared audio. При больших upload это быстро станет проблемой.
+- Нет авторизации. Для локального инструмента нормально, но при доступе в сеть API позволяет загружать большие файлы и читать/удалять задачи.
+- Frontend polling работает просто, но не оптимально: два независимых polling loop каждые 5 секунд, без backoff и без pause при hidden tab.
+- UI почти не использует structured error code/details и segment-level quality_flags.
+
+Что улучшить:
+- Добавить smoke health endpoint, который проверяет наличие ffmpeg/ffprobe, доступность data dirs и возможность загрузить/инициализировать модель по требованию.
+- Добавить retention policy: удаление старых оригиналов/prepared/results по возрасту или лимиту диска.
+- Добавить benchmark dataset: несколько русских записей разного качества с эталонными текстами, расчет WER/CER и RTF.
+- Добавить CI: pytest, frontend build, базовый lint/format.
+- Зафиксировать версии ключевых backend-зависимостей.
+- Добавить auth или хотя бы simple token/API key, если приложение будет доступно не только на localhost.
+- Улучшить frontend polling: один источник состояния, backoff при ошибках, pause при document.hidden.
+- Раскрыть в UI quality_flags по сегментам: низкая уверенность, high no_speech, rescue applied.
+
+
+7. Приоритетный список улучшений
+
+1. Убрать legacy raw string из backend/app/queue_worker.py и отключенный legacy-блок из backend/tests/test_queue_worker.py. Это самый заметный технический долг.
+2. Прогнать реальные benchmark на 5-10 типовых аудио: clean speech, noisy phone, quiet lecture, long 1+ hour, video container. Сравнить robust_long_noisy vs balanced по WER/CER и RTF.
+3. Проверить ресурсную модель CPU: начать с WHISPER_WORKER_PROCESSES=1, затем сравнить с 2 процессами. Решение принимать по RTF, RAM и стабильности.
+4. Добавить chunked VAD или другой способ не загружать весь 1-4 часовой файл в память.
+5. Добавить global quality guard на повторы, пустые результаты и аномально короткую транскрибацию.
+6. Сделать rescue replacement более аккуратным, чтобы не удалять хорошие сегменты на границах padded window.
+7. Разделить ffprobe timeout и ffmpeg preprocess timeout.
+8. Добавить clean/light профиль предобработки и сделать выбор профиля осознанным.
+9. Укрепить runtime config parsing, чтобы плохие env-переменные не валили startup.
+10. Добавить cleanup/retention для upload, prepared audio, logs и старых задач.
+11. Добавить TestClient-интеграционные тесты для POST /api/jobs, GET detail/list/audio и error payloads.
+12. Вернуть quality_flags в API как структурированный объект или добавить отдельные structured поля.
+
+
+8. Финальная оценка
+
+WhisperIO уже имеет правильное направление: это не просто вызов Whisper, а полноценный pipeline с подготовкой аудио, VAD-сегментацией, повторной обработкой плохих фрагментов, очередью и UI для проверки результата. Для локальной транскрибации длинных русскоязычных записей проект выглядит перспективно.
+
+Главное, что я бы не стал менять: идея modular quality-first pipeline, mono/16kHz preprocessing, внешняя VAD-сегментация, condition_on_previous_text=false для независимых окон и segment-level rescue.
+
+Главное, что нужно улучшить перед серьезным использованием: убрать legacy-мусор, проверить реальные настройки на железе, снизить риск RAM на длинных файлах, добавить глобальный контроль качества и построить маленький, но постоянный benchmark-набор. После этого проект станет намного надежнее как инструмент транскрибации, а не только как рабочий прототип.

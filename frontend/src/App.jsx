@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Document, Packer, Paragraph, TextRun } from "docx";
-import { createJob, deleteJob, fetchJob, fetchJobs, fetchStats, getJobAudioUrl } from "./api";
+
+import { createJob, deleteJob, fetchJob, fetchJobs, getJobAudioUrl } from "./api";
 
 const STATUS_LABELS = {
   queued: "В очереди",
@@ -12,11 +13,11 @@ const STATUS_LABELS = {
 const STAGE_LABELS = {
   queued: "Ожидает запуска",
   preparing: "Подготовка",
-  preprocessing: "Предобработка аудио",
-  transcribing: "Распознавание речи",
-  saving_segments: "Сохранение сегментов",
+  preprocessing: "Предобработка",
+  transcribing: "Транскрибация",
+  saving_segments: "Сохранение",
   completed: "Завершено",
-  failed: "Сбой обработки",
+  failed: "Сбой",
 };
 
 const POLL_INTERVAL_MS = 5000;
@@ -30,24 +31,6 @@ function formatTimestamp(seconds) {
   const min = String(totalMin % 60).padStart(2, "0");
   const hrs = String(Math.floor(totalMin / 60)).padStart(2, "0");
   return `${hrs}:${min}:${sec}.${ms}`;
-}
-
-function formatTimestampHms(seconds) {
-  const totalSec = Math.max(0, Math.round(Number(seconds) || 0));
-  const sec = String(totalSec % 60).padStart(2, "0");
-  const totalMin = Math.floor(totalSec / 60);
-  const min = String(totalMin % 60).padStart(2, "0");
-  const hrs = String(Math.floor(totalMin / 60)).padStart(2, "0");
-  return `${hrs}:${min}:${sec}`;
-}
-
-function buildWordFilename(originalFilename) {
-  const baseName = (originalFilename || "transcript").replace(/\.[^/.]+$/, "").trim();
-  const safeName = baseName
-    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
-    .replace(/\s+/g, " ")
-    .trim();
-  return `${safeName || "transcript"}_transcript.docx`;
 }
 
 function formatDateTime(value) {
@@ -78,34 +61,13 @@ function formatDurationMs(value) {
   return hrs > 0 ? `${hrs}:${min}:${sec}` : `${min}:${sec}`;
 }
 
-function formatHourlySpeed(value) {
-  if (typeof value !== "number" || Number.isNaN(value) || value < 0) {
-    return "n/a";
-  }
-  return `${formatDurationMs(value)} / час аудио`;
-}
-
-function dateValueToIso(dateValue, endOfDay = false) {
-  if (!dateValue) {
-    return null;
-  }
-  const date = new Date(`${dateValue}T00:00:00`);
-  if (Number.isNaN(date.getTime())) {
-    return null;
-  }
-  if (endOfDay) {
-    date.setHours(23, 59, 59, 999);
-  }
-  return date.toISOString();
-}
-
-function formatWhisperSettings(job) {
-  const model = job?.whisper_model_size || "n/a";
-  const cpuThreads =
-    typeof job?.whisper_cpu_threads === "number" ? job.whisper_cpu_threads : "n/a";
-  const beamSize =
-    typeof job?.whisper_beam_size === "number" ? job.whisper_beam_size : "n/a";
-  return `Model: ${model} | CPU_THREADS: ${cpuThreads} | BEAM_SIZE: ${beamSize}`;
+function buildWordFilename(originalFilename) {
+  const baseName = (originalFilename || "transcript").replace(/\.[^/.]+$/, "").trim();
+  const safeName = baseName
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim();
+  return `${safeName || "transcript"}_transcript.docx`;
 }
 
 function getStatusClass(status) {
@@ -121,15 +83,25 @@ function getStatusClass(status) {
   return "is-neutral";
 }
 
+function parseQualityFlags(value) {
+  if (!value || typeof value !== "string") {
+    return null;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
 function App() {
-  const [activeTab, setActiveTab] = useState("jobs");
   const [jobs, setJobs] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [selectedJob, setSelectedJob] = useState(null);
   const [audioVariant, setAudioVariant] = useState("original");
   const [file, setFile] = useState(null);
-  const [isDeleting, setIsDeleting] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
   const [isJobsLoading, setIsJobsLoading] = useState(true);
   const [isJobLoading, setIsJobLoading] = useState(false);
   const [jobsError, setJobsError] = useState("");
@@ -137,27 +109,20 @@ function App() {
   const [jobSuccess, setJobSuccess] = useState("");
   const [uploadError, setUploadError] = useState("");
   const [uploadSuccess, setUploadSuccess] = useState("");
-  const [statsFrom, setStatsFrom] = useState("");
-  const [statsTo, setStatsTo] = useState("");
-  const [stats, setStats] = useState(null);
-  const [statsLoading, setStatsLoading] = useState(false);
-  const [statsError, setStatsError] = useState("");
   const audioRef = useRef(null);
 
-  const selectedJobFromList = useMemo(
+  const selectedFromList = useMemo(
     () => jobs.find((job) => job.id === selectedId) || null,
     [jobs, selectedId]
   );
-  const selectedJobStatusLabel =
-    STATUS_LABELS[selectedJob?.status] || selectedJob?.status || "Неизвестно";
-  const selectedJobStageLabel = STAGE_LABELS[selectedJob?.stage] || selectedJob?.stage;
-  const selectedJobSupportsPreparedAudio = Boolean(selectedJob?.prepared_audio_url);
+  const selectedSupportsPreparedAudio = Boolean(selectedJob?.prepared_audio_url);
   const selectedAudioUrl =
     selectedJob &&
     getJobAudioUrl(
       selectedJob.id,
-      audioVariant === "prepared" && selectedJobSupportsPreparedAudio ? "prepared" : "original"
+      audioVariant === "prepared" && selectedSupportsPreparedAudio ? "prepared" : "original"
     );
+  const qualityFlags = parseQualityFlags(selectedJob?.quality_flags);
 
   async function refreshJobs({ silent = false } = {}) {
     if (!silent) {
@@ -172,8 +137,8 @@ function App() {
       } else if (selectedId && !data.some((job) => job.id === selectedId)) {
         setSelectedId(data[0]?.id || null);
       }
-    } catch (err) {
-      setJobsError(err.message);
+    } catch (error) {
+      setJobsError(error.message);
     } finally {
       if (!silent) {
         setIsJobsLoading(false);
@@ -189,7 +154,6 @@ function App() {
         refreshJobs({ silent: true });
       }
     }, POLL_INTERVAL_MS);
-
     return () => {
       mounted = false;
       clearInterval(intervalId);
@@ -201,12 +165,12 @@ function App() {
       setSelectedJob(null);
       return;
     }
-
     setAudioVariant("original");
     setJobSuccess("");
     let mounted = true;
+
     async function loadJob(silent = false) {
-      if (mounted && !silent) {
+      if (!silent) {
         setIsJobLoading(true);
       }
       try {
@@ -215,9 +179,9 @@ function App() {
           setSelectedJob(data);
           setJobError("");
         }
-      } catch (err) {
+      } catch (error) {
         if (mounted) {
-          setJobError(err.message);
+          setJobError(error.message);
         }
       } finally {
         if (mounted && !silent) {
@@ -234,32 +198,10 @@ function App() {
     };
   }, [selectedId]);
 
-  async function loadStats() {
-    setStatsLoading(true);
-    try {
-      const data = await fetchStats({
-        from: dateValueToIso(statsFrom),
-        to: dateValueToIso(statsTo, true),
-      });
-      setStats(data);
-      setStatsError("");
-    } catch (err) {
-      setStatsError(err.message);
-    } finally {
-      setStatsLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    if (activeTab === "stats") {
-      loadStats();
-    }
-  }, [activeTab]);
-
   async function onSubmit(event) {
     event.preventDefault();
     if (!file) {
-      setUploadError("Сначала выберите аудиофайл.");
+      setUploadError("Сначала выберите файл.");
       setUploadSuccess("");
       return;
     }
@@ -268,30 +210,17 @@ function App() {
     setJobSuccess("");
     setUploading(true);
     try {
-      const { job_id: jobId } = await createJob(file);
+      const payload = await createJob(file);
       const list = await fetchJobs();
       setJobs(list);
-      setSelectedId(jobId);
+      setSelectedId(payload.job_id);
       setFile(null);
-      setUploadSuccess("Файл успешно загружен. Транскрибация уже в очереди.");
+      setUploadSuccess("Файл загружен, задача поставлена в очередь.");
       event.target.reset();
-    } catch (err) {
-      setUploadError(err.message);
+    } catch (error) {
+      setUploadError(error.message);
     } finally {
       setUploading(false);
-    }
-  }
-
-  async function onSegmentClick(segment) {
-    const player = audioRef.current;
-    if (!player) {
-      return;
-    }
-    try {
-      player.currentTime = Number(segment.start_sec || 0);
-      await player.play();
-    } catch {
-      // Browser may block autoplay without direct interaction.
     }
   }
 
@@ -300,7 +229,7 @@ function App() {
     if (!currentId || isDeleting) {
       return;
     }
-    const accepted = window.confirm("Удалить выбранную заявку?");
+    const accepted = window.confirm("Удалить выбранную задачу?");
     if (!accepted) {
       return;
     }
@@ -322,10 +251,23 @@ function App() {
           setSelectedId(list[0]?.id || null);
         }
       }
-    } catch (err) {
-      setJobError(err.message);
+    } catch (error) {
+      setJobError(error.message);
     } finally {
       setIsDeleting(false);
+    }
+  }
+
+  async function onSegmentClick(segment) {
+    const player = audioRef.current;
+    if (!player) {
+      return;
+    }
+    try {
+      player.currentTime = Number(segment.start_sec || 0);
+      await player.play();
+    } catch {
+      // Browser may block autoplay without direct interaction.
     }
   }
 
@@ -341,34 +283,26 @@ function App() {
 
     try {
       setJobError("");
-      const docParagraphs = [];
+      const paragraphs = [];
       segments.forEach((segment, index) => {
-        docParagraphs.push(
+        paragraphs.push(
           new Paragraph({
             children: [
-              new TextRun(
-                `(${formatTimestampHms(segment.start_sec)}-${formatTimestampHms(segment.end_sec)})`
-              ),
+              new TextRun(`(${formatTimestamp(segment.start_sec)} - ${formatTimestamp(segment.end_sec)})`),
             ],
           }),
           new Paragraph({
             children: [new TextRun(segment.text || "")],
           })
         );
-
         if (index < segments.length - 1) {
-          docParagraphs.push(new Paragraph(""));
+          paragraphs.push(new Paragraph(""));
         }
       });
 
       const doc = new Document({
-        sections: [
-          {
-            children: docParagraphs,
-          },
-        ],
+        sections: [{ children: paragraphs }],
       });
-
       const blob = await Packer.toBlob(doc);
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
@@ -389,53 +323,36 @@ function App() {
         <div>
           <h1>WhisperIO</h1>
           <p className="subtitle">
-            Современный desktop-first интерфейс для очереди транскрибаций и удобного чтения результата.
+            Очередь транскрибации длинных и шумных аудио/видео файлов с quality-first обработкой.
           </p>
         </div>
         <div className="topbar-chip">API polling: 5s</div>
       </header>
 
-      <section className="card tabs-card">
-        <div className="tabs">
-          <button
-            type="button"
-            className={activeTab === "jobs" ? "tab-button active" : "tab-button"}
-            onClick={() => setActiveTab("jobs")}
-          >
-            Очередь
-          </button>
-          <button
-            type="button"
-            className={activeTab === "stats" ? "tab-button active" : "tab-button"}
-            onClick={() => setActiveTab("stats")}
-          >
-            Статистика
-          </button>
-        </div>
-      </section>
-
       <section className="card upload-card">
         <h2>Новая транскрибация</h2>
-        <p className="section-caption">Поддерживаются аудиофайлы и видео-контейнеры с аудиодорожкой. После загрузки задача появится в списке слева.</p>
+        <p className="section-caption">
+          Загрузите аудио или видео-контейнер с дорожкой. Система автоматически применит предобработку
+          и сегментацию для слабослышимой речи.
+        </p>
         <form onSubmit={onSubmit} className="upload-form">
           <label className="file-control">
-            <span>Аудиофайл</span>
+            <span>Файл</span>
             <input
               type="file"
-              accept="audio/*,video/*,.mkv,.avi,.mov"
+              accept="audio/*,video/*,.mkv,.avi,.mov,.mp4,.webm"
               onChange={(event) => setFile(event.target.files?.[0] || null)}
             />
           </label>
           <button type="submit" disabled={uploading} className="primary-button">
-            {uploading ? "Загрузка..." : "Загрузить"}
+            {uploading ? "Загрузка..." : "Запустить"}
           </button>
         </form>
         {uploadError && <p className="inline-message is-danger">{uploadError}</p>}
         {uploadSuccess && <p className="inline-message is-success">{uploadSuccess}</p>}
       </section>
 
-      {activeTab === "jobs" && (
-        <main className="grid content-grid">
+      <main className="grid content-grid">
         <section className="card jobs-card">
           <div className="section-head">
             <h2>Задачи</h2>
@@ -450,14 +367,14 @@ function App() {
             </div>
           )}
           {!isJobsLoading && jobs.length === 0 && (
-            <p className="empty-state">Пока нет задач. Загрузите первый аудиофайл.</p>
+            <p className="empty-state">Пока нет задач. Загрузите первый файл.</p>
           )}
           <ul className="job-list">
             {jobs.map((job) => (
               <li key={job.id}>
                 <button
-                  className={job.id === selectedId ? "job-item active" : "job-item"}
                   type="button"
+                  className={job.id === selectedId ? "job-item active" : "job-item"}
                   onClick={() => setSelectedId(job.id)}
                 >
                   <div className="job-row">
@@ -466,9 +383,7 @@ function App() {
                       {STATUS_LABELS[job.status] || job.status}
                     </span>
                   </div>
-                  <span className="meta">
-                    Этап: {STAGE_LABELS[job.stage] || job.stage || "Ожидание"}
-                  </span>
+                  <span className="meta">Этап: {STAGE_LABELS[job.stage] || job.stage || "Ожидание"}</span>
                   {typeof job.progress === "number" && (
                     <div className="progress-wrap">
                       <span>Прогресс: {Math.round(job.progress)}%</span>
@@ -481,7 +396,6 @@ function App() {
                     </div>
                   )}
                   <span className="meta">Создано: {formatDateTime(job.created_at)}</span>
-                  <span className="meta">{formatWhisperSettings(job)}</span>
                 </button>
               </li>
             ))}
@@ -493,7 +407,8 @@ function App() {
           {jobError && <p className="inline-message is-danger">{jobError}</p>}
           {jobSuccess && <p className="inline-message is-success">{jobSuccess}</p>}
           {!selectedId && <p className="empty-state">Выберите задачу, чтобы посмотреть детали.</p>}
-          {selectedId && isJobLoading && <p className="loading-state">Загружаем детали задачи...</p>}
+          {selectedId && isJobLoading && <p className="loading-state">Загружаем детали...</p>}
+
           {selectedJob && (
             <>
               <div className="result-head">
@@ -501,12 +416,13 @@ function App() {
                   <strong>Файл:</strong> {selectedJob.original_filename}
                 </p>
                 <span className={`status-pill ${getStatusClass(selectedJob.status)}`}>
-                  {selectedJobStatusLabel}
+                  {STATUS_LABELS[selectedJob.status] || selectedJob.status}
                 </span>
               </div>
+
               {selectedJob.stage && (
                 <p>
-                  <strong>Этап:</strong> {selectedJobStageLabel}
+                  <strong>Этап:</strong> {STAGE_LABELS[selectedJob.stage] || selectedJob.stage}
                 </p>
               )}
               {typeof selectedJob.progress === "number" && (
@@ -519,19 +435,12 @@ function App() {
                   <strong>Детали:</strong> {selectedJob.status_message}
                 </p>
               )}
-              <p>
-                <strong>Настройки:</strong> {formatWhisperSettings(selectedJob)}
-              </p>
               {selectedJob.error && (
                 <p className="inline-message is-danger">
                   <strong>Ошибка:</strong> {selectedJob.error}
                 </p>
               )}
-              {selectedJob.error_code && (
-                <p className="inline-message is-danger">
-                  <strong>Код ошибки:</strong> {selectedJob.error_code}
-                </p>
-              )}
+
               <div className="result-actions">
                 <button
                   type="button"
@@ -539,41 +448,46 @@ function App() {
                   onClick={onDeleteSelectedJob}
                   disabled={isDeleting}
                 >
-                  {isDeleting ? "Удаление..." : "Удалить заявку"}
+                  {isDeleting ? "Удаление..." : "Удалить задачу"}
                 </button>
               </div>
+
               {selectedJob.delete_requested && (
                 <p className="loading-state">
-                  Удаление запрошено. Заявка будет удалена после завершения текущего этапа.
+                  Удаление запрошено. Задача будет удалена после завершения текущего этапа.
                 </p>
               )}
               {selectedJob.status !== "done" && (
-                <p className="loading-state">Транскрибация выполняется в очереди.</p>
+                <p className="loading-state">Транскрибация выполняется. Обновление каждые 5 секунд.</p>
               )}
+
               {selectedJob.status === "done" && (
                 <>
                   <p>
-                    <strong>Длительность:</strong>{" "}
-                    {formatTimestamp(selectedJob.duration_sec || 0)}
-                  </p>
-                  <p>
-                    <strong>Время транскрибации:</strong>{" "}
-                    {formatDurationMs(
-                      selectedJob.transcribe_duration_ms ?? selectedJob.processing_duration_ms
-                    )}
+                    <strong>Длительность аудио:</strong> {formatTimestamp(selectedJob.duration_sec || 0)}
                   </p>
                   <p>
                     <strong>Предобработка:</strong> {formatDurationMs(selectedJob.preprocess_duration_ms)}
                   </p>
                   <p>
+                    <strong>Транскрибация:</strong> {formatDurationMs(selectedJob.transcribe_duration_ms)}
+                  </p>
+                  <p>
                     <strong>Общее время:</strong> {formatDurationMs(selectedJob.processing_duration_ms)}
                   </p>
+                  {qualityFlags && (
+                    <p className="meta">
+                      VAD-окон: {qualityFlags.vad_window_count || 0}, rescue-окон:{" "}
+                      {qualityFlags.rescue_window_count || 0}, применено rescue:{" "}
+                      {qualityFlags.rescue_applied_count || 0}
+                    </p>
+                  )}
                   <div className="result-actions">
                     <button
                       type="button"
                       className="secondary-button"
                       onClick={onDownloadWord}
-                      disabled={selectedJob.segments.length === 0}
+                      disabled={(selectedJob.segments || []).length === 0}
                     >
                       Скачать Word (.docx)
                     </button>
@@ -582,14 +496,14 @@ function App() {
                     <span>Источник аудио</span>
                     <select
                       value={
-                        audioVariant === "prepared" && !selectedJobSupportsPreparedAudio
+                        audioVariant === "prepared" && !selectedSupportsPreparedAudio
                           ? "original"
                           : audioVariant
                       }
                       onChange={(event) => setAudioVariant(event.target.value)}
                     >
                       <option value="original">Оригинал</option>
-                      <option value="prepared" disabled={!selectedJobSupportsPreparedAudio}>
+                      <option value="prepared" disabled={!selectedSupportsPreparedAudio}>
                         Обработанное
                       </option>
                     </select>
@@ -603,8 +517,8 @@ function App() {
                     src={selectedAudioUrl}
                   />
                   <div className="segments">
-                    {selectedJob.segments.length === 0 && <p>Текстовые сегменты отсутствуют.</p>}
-                    {selectedJob.segments.map((segment) => (
+                    {(selectedJob.segments || []).length === 0 && <p>Сегменты отсутствуют.</p>}
+                    {(selectedJob.segments || []).map((segment) => (
                       <div key={`${segment.idx}-${segment.start_sec}`} className="segment">
                         <button
                           type="button"
@@ -612,8 +526,7 @@ function App() {
                           onClick={() => onSegmentClick(segment)}
                         >
                           <span className="stamp">
-                            {formatTimestamp(segment.start_sec)} -{" "}
-                            {formatTimestamp(segment.end_sec)}
+                            {formatTimestamp(segment.start_sec)} - {formatTimestamp(segment.end_sec)}
                           </span>
                           <p>{segment.text}</p>
                         </button>
@@ -624,70 +537,17 @@ function App() {
               )}
             </>
           )}
-          {selectedId && !selectedJob && selectedJobFromList?.status && !isJobLoading && (
+
+          {selectedId && !selectedJob && selectedFromList?.status && !isJobLoading && (
             <p className="loading-state">
-              Текущий статус: {STATUS_LABELS[selectedJobFromList.status] || selectedJobFromList.status}
+              Текущий статус: {STATUS_LABELS[selectedFromList.status] || selectedFromList.status}
             </p>
           )}
         </section>
       </main>
-      )}
-
-      {activeTab === "stats" && (
-        <section className="card stats-card">
-          <div className="section-head">
-            <h2>Статистика обработки</h2>
-            <button type="button" className="secondary-button" onClick={loadStats} disabled={statsLoading}>
-              {statsLoading ? "Обновление..." : "Обновить"}
-            </button>
-          </div>
-          <div className="stats-filters">
-            <label>
-              <span>Дата от</span>
-              <input
-                type="date"
-                value={statsFrom}
-                onChange={(event) => setStatsFrom(event.target.value)}
-              />
-            </label>
-            <label>
-              <span>Дата до</span>
-              <input type="date" value={statsTo} onChange={(event) => setStatsTo(event.target.value)} />
-            </label>
-          </div>
-          {statsError && <p className="inline-message is-danger">{statsError}</p>}
-          {!statsLoading && stats && (
-            <>
-              <p className="meta">Завершенных заявок в диапазоне: {stats.completed_jobs}</p>
-              <div className="stats-grid">
-                <article className="stats-tile">
-                  <h3>Средняя скорость</h3>
-                  <p><strong>Итог:</strong> {formatHourlySpeed(stats.average.total_ms)}</p>
-                  <p><strong>Предобработка:</strong> {formatHourlySpeed(stats.average.preprocess_ms)}</p>
-                  <p><strong>Транскрибация:</strong> {formatHourlySpeed(stats.average.transcribe_ms)}</p>
-                </article>
-                <article className="stats-tile">
-                  <h3>Самое быстрое</h3>
-                  <p className="meta">{stats.fastest.original_filename || "n/a"}</p>
-                  <p><strong>Итог:</strong> {formatHourlySpeed(stats.fastest.total_ms)}</p>
-                  <p><strong>Предобработка:</strong> {formatHourlySpeed(stats.fastest.preprocess_ms)}</p>
-                  <p><strong>Транскрибация:</strong> {formatHourlySpeed(stats.fastest.transcribe_ms)}</p>
-                </article>
-                <article className="stats-tile">
-                  <h3>Самое долгое</h3>
-                  <p className="meta">{stats.slowest.original_filename || "n/a"}</p>
-                  <p><strong>Итог:</strong> {formatHourlySpeed(stats.slowest.total_ms)}</p>
-                  <p><strong>Предобработка:</strong> {formatHourlySpeed(stats.slowest.preprocess_ms)}</p>
-                  <p><strong>Транскрибация:</strong> {formatHourlySpeed(stats.slowest.transcribe_ms)}</p>
-                </article>
-              </div>
-            </>
-          )}
-          {statsLoading && <p className="loading-state">Загружаем статистику...</p>}
-        </section>
-      )}
     </div>
   );
 }
 
 export default App;
+

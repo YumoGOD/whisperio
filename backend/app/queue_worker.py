@@ -1,9 +1,668 @@
+from app.transcription_worker import TranscriptionWorker, utc_now_iso
+
+# Legacy module kept only for compatibility imports.
+# The active implementation lives in `app.transcription_worker`.
+
+r'''
+import asyncio
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover
+    psutil = None
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - not available on Windows
+    resource = None
+
+from faster_whisper import WhisperModel
+
+from app.db import get_connection, get_queue_stats
+from app.logging_utils import bind_log_context, log_event, reset_log_context
+from app.models import JobStage, JobStatus
+from app.transcription.inference import InferenceResult, transcribe_windows
+from app.transcription.pipeline import QualityFirstPipeline
+from app.transcription.preprocess import (
+    AudioPreprocessError,
+    cleanup_prepared_audio,
+    prepare_audio,
+    probe_audio,
+)
+from app.transcription.segmenter import AudioWindow
+from app.transcription.settings import DecodeSettings, load_transcription_settings
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_env_int(name: str, default: int, *, min_value: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return default
+    return max(min_value, parsed)
+
+
+class TranscriptionWorker:
+    def __init__(self) -> None:
+        self.logger = logging.getLogger("whisperio.worker")
+        self.settings = load_transcription_settings()
+        self.model: WhisperModel | None = None
+        self._model_lock = asyncio.Lock()
+        self._transcribe_lock = asyncio.Lock()
+        self._pipeline = QualityFirstPipeline(settings=self.settings, transcribe_fn=self._run_transcribe)
+        self.sla_rtf_threshold = max(0.01, float(os.getenv("WHISPER_SLA_RTF_THRESHOLD", "0.25")))
+        self.resource_snapshot_interval_sec = _safe_env_int("LOG_SNAPSHOT_INTERVAL_SEC", 10, min_value=1)
+        self._last_resource_snapshot_ts = 0.0
+
+    def process_claimed_job(self, job_id: str) -> None:
+        asyncio.run(self._process_job(job_id))
+
+    async def _get_model(self) -> WhisperModel:
+        if self.model is not None:
+            return self.model
+        async with self._model_lock:
+            if self.model is None:
+                self.model = await asyncio.to_thread(
+                    WhisperModel,
+                    self.settings.model_name,
+                    device=self.settings.model_device,
+                    compute_type=self.settings.model_compute_type,
+                    cpu_threads=self.settings.model_cpu_threads,
+                    num_workers=self.settings.model_workers,
+                )
+        return self.model
+
+    async def _run_transcribe(
+        self,
+        model: WhisperModel,
+        audio_path: str,
+        windows: list[AudioWindow],
+        decode: DecodeSettings,
+    ) -> InferenceResult:
+        async with self._transcribe_lock:
+            return await asyncio.to_thread(
+                transcribe_windows,
+                model,
+                audio_path=audio_path,
+                windows=windows,
+                decode=decode,
+                language=self.settings.language,
+                task=self.settings.task,
+            )
+
+    def _is_delete_requested(self, conn, job_id: str) -> bool:
+        row = conn.execute(
+            "SELECT delete_requested FROM transcription_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if not row:
+            return False
+        return bool(row["delete_requested"])
+
+    def _finalize_delete(self, job_id: str, prepared_audio_path: str | None) -> None:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT stored_path, prepared_audio_path FROM transcription_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                return
+            stored_path = row["stored_path"]
+            kept_prepared_path = row["prepared_audio_path"]
+            conn.execute("DELETE FROM transcription_jobs WHERE id = ?", (job_id,))
+
+        for candidate in (stored_path, kept_prepared_path, prepared_audio_path):
+            if not candidate:
+                continue
+            path = Path(candidate)
+            if path.exists() and path.is_file():
+                path.unlink(missing_ok=True)
+
+        self._log_event(
+            event="job_deleted_after_processing_step",
+            job_id=job_id,
+            stage=JobStage.COMPLETED,
+            status=JobStatus.DONE,
+            progress=100.0,
+        )
+
+    async def _process_job(self, job_id: str) -> None:
+        started_wall_time = time.perf_counter()
+        prepared_audio_path: str | None = None
+        source_duration_sec: float = 0.0
+        decode_duration_ms: int | None = None
+        preprocess_duration_ms: int | None = None
+        transcribe_duration_ms: int | None = None
+        persist_duration_ms: int | None = None
+        quality_flags_json: str | None = None
+        request_id: str | None = None
+        audio_size_bytes: int | None = None
+
+        log_context_token = bind_log_context(worker_pid=os.getpid(), job_id=job_id)
+        try:
+            with get_connection() as conn:
+                job = conn.execute(
+                    "SELECT stored_path, request_id, delete_requested FROM transcription_jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+            if not job:
+                self._log_event(
+                    event="job_not_found",
+                    job_id=job_id,
+                    stage=JobStage.FAILED,
+                    error_code="JOB_NOT_FOUND",
+                )
+                return
+
+            request_id = job["request_id"]
+            reset_log_context(log_context_token)
+            log_context_token = bind_log_context(
+                worker_pid=os.getpid(),
+                job_id=job_id,
+                request_id=request_id,
+            )
+
+            with get_connection() as conn:
+                self._update_job(
+                    conn=conn,
+                    job_id=job_id,
+                    status=JobStatus.PROCESSING,
+                    stage=JobStage.PREPARING,
+                    progress=5.0,
+                    status_message="Подготовка к распознаванию",
+                    started_at=utc_now_iso(),
+                    clear_error=True,
+                )
+
+            audio_path = str(job["stored_path"])
+            if bool(job["delete_requested"]):
+                self._finalize_delete(job_id, prepared_audio_path)
+                return
+            if Path(audio_path).exists():
+                audio_size_bytes = Path(audio_path).stat().st_size
+
+            self._log_event(
+                event="job_started",
+                job_id=job_id,
+                stage=JobStage.PREPARING,
+                status=JobStatus.PROCESSING,
+                progress=5.0,
+                extra_fields={
+                    "audio_size_bytes": audio_size_bytes,
+                    "profile": self.settings.profile.name,
+                    "model_name": self.settings.model_name,
+                    "language": self.settings.language,
+                },
+            )
+            self._log_resource_snapshot(job_id=job_id, stage=JobStage.PREPARING, force=True)
+
+            decode_started = time.perf_counter()
+            source_probe = await asyncio.to_thread(
+                probe_audio,
+                audio_path,
+                timeout_sec=self.settings.preprocess.timeout_sec,
+            )
+            decode_duration_ms = int((time.perf_counter() - decode_started) * 1000)
+            source_duration_sec = source_probe.duration_sec
+
+            with get_connection() as conn:
+                self._update_job(
+                    conn=conn,
+                    job_id=job_id,
+                    status=JobStatus.PROCESSING,
+                    stage=JobStage.PREPROCESSING,
+                    progress=12.0,
+                    status_message="Шумоподавление и нормализация аудио",
+                    decode_duration_ms=decode_duration_ms,
+                )
+
+            preprocess_started = time.perf_counter()
+            prepared_audio_path = await asyncio.to_thread(
+                prepare_audio,
+                audio_path,
+                sample_rate=self.settings.preprocess.sample_rate,
+                timeout_sec=self.settings.preprocess.timeout_sec,
+                filters=self.settings.preprocess.ffmpeg_filters,
+            )
+            preprocess_duration_ms = int((time.perf_counter() - preprocess_started) * 1000)
+
+            with get_connection() as conn:
+                self._update_job(
+                    conn=conn,
+                    job_id=job_id,
+                    status=JobStatus.PROCESSING,
+                    stage=JobStage.PREPROCESSING,
+                    progress=22.0,
+                    status_message="Аудио подготовлено",
+                    preprocess_duration_ms=preprocess_duration_ms,
+                    decode_duration_ms=decode_duration_ms,
+                    prepared_audio_path=(
+                        prepared_audio_path if self.settings.preprocess.keep_prepared_audio else None
+                    ),
+                )
+                if self._is_delete_requested(conn, job_id):
+                    self._finalize_delete(job_id, prepared_audio_path)
+                    return
+
+            with get_connection() as conn:
+                self._update_job(
+                    conn=conn,
+                    job_id=job_id,
+                    status=JobStatus.PROCESSING,
+                    stage=JobStage.TRANSCRIBING,
+                    progress=30.0,
+                    status_message="Транскрибация сегментов речи",
+                )
+
+            model = await self._get_model()
+            transcribe_started = time.perf_counter()
+            pipeline_result = await self._pipeline.run(
+                model=model,
+                prepared_audio_path=prepared_audio_path or audio_path,
+                fallback_duration_sec=source_duration_sec,
+            )
+            transcribe_duration_ms = int((time.perf_counter() - transcribe_started) * 1000)
+
+            quality_flags_json = json.dumps(pipeline_result.quality_payload, ensure_ascii=False)
+            segment_rows = [
+                (
+                    job_id,
+                    idx,
+                    float(segment["start_sec"]),
+                    float(segment["end_sec"]),
+                    str(segment["text"]),
+                    str(segment["label"]),
+                    float(segment["confidence"]),
+                    json.dumps(segment["quality_flags"], ensure_ascii=False),
+                )
+                for idx, segment in enumerate(pipeline_result.segment_rows)
+            ]
+
+            self._log_event(
+                event="stage_finished",
+                job_id=job_id,
+                stage=JobStage.TRANSCRIBING,
+                status=JobStatus.PROCESSING,
+                progress=82.0,
+                duration_ms=transcribe_duration_ms,
+                segment_count=len(segment_rows),
+                audio_duration_sec=pipeline_result.duration_sec,
+                extra_fields={
+                    "vad_window_count": pipeline_result.vad_window_count,
+                    "rescue_window_count": pipeline_result.rescue_window_count,
+                    "rescue_applied_count": pipeline_result.quality_payload.get("rescue_applied_count", 0),
+                },
+            )
+
+            with get_connection() as conn:
+                self._update_job(
+                    conn=conn,
+                    job_id=job_id,
+                    status=JobStatus.PROCESSING,
+                    stage=JobStage.SAVING_SEGMENTS,
+                    progress=88.0,
+                    status_message=f"Сохранение сегментов: {len(segment_rows)}",
+                    transcribe_duration_ms=transcribe_duration_ms,
+                    preprocess_duration_ms=preprocess_duration_ms,
+                    decode_duration_ms=decode_duration_ms,
+                    quality_flags=quality_flags_json,
+                    prepared_audio_path=(
+                        prepared_audio_path if self.settings.preprocess.keep_prepared_audio else None
+                    ),
+                )
+                if self._is_delete_requested(conn, job_id):
+                    self._finalize_delete(job_id, prepared_audio_path)
+                    return
+
+            persist_started = time.perf_counter()
+            with get_connection() as conn:
+                conn.execute("DELETE FROM transcription_segments WHERE job_id = ?", (job_id,))
+                if segment_rows:
+                    conn.executemany(
+                        """
+                        INSERT INTO transcription_segments
+                        (job_id, idx, start_sec, end_sec, text, label, confidence, quality_flags)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        segment_rows,
+                    )
+                wall_duration_ms = int((time.perf_counter() - started_wall_time) * 1000)
+                self._update_job(
+                    conn=conn,
+                    job_id=job_id,
+                    status=JobStatus.DONE,
+                    stage=JobStage.COMPLETED,
+                    progress=100.0,
+                    status_message="Транскрибация завершена",
+                    finished_at=utc_now_iso(),
+                    duration_sec=pipeline_result.duration_sec,
+                    processing_duration_ms=wall_duration_ms,
+                    transcribe_duration_ms=transcribe_duration_ms,
+                    preprocess_duration_ms=preprocess_duration_ms,
+                    decode_duration_ms=decode_duration_ms,
+                    prepared_audio_path=(
+                        prepared_audio_path if self.settings.preprocess.keep_prepared_audio else None
+                    ),
+                    quality_flags=quality_flags_json,
+                    clear_error=True,
+                )
+            persist_duration_ms = int((time.perf_counter() - persist_started) * 1000)
+            with get_connection() as conn:
+                self._update_job(
+                    conn=conn,
+                    job_id=job_id,
+                    persist_duration_ms=persist_duration_ms,
+                )
+
+            rtf = None
+            effective_speed_x = None
+            if pipeline_result.duration_sec > 0:
+                processing_sec = wall_duration_ms / 1000.0
+                rtf = round(processing_sec / pipeline_result.duration_sec, 6)
+                effective_speed_x = round(pipeline_result.duration_sec / max(processing_sec, 1e-6), 6)
+
+            self._log_event(
+                event="job_completed",
+                job_id=job_id,
+                stage=JobStage.COMPLETED,
+                status=JobStatus.DONE,
+                progress=100.0,
+                duration_ms=wall_duration_ms,
+                segment_count=len(segment_rows),
+                persist_duration_ms=persist_duration_ms,
+                audio_duration_sec=pipeline_result.duration_sec,
+                extra_fields={
+                    "decode_duration_ms": decode_duration_ms,
+                    "preprocess_duration_ms": preprocess_duration_ms,
+                    "transcribe_duration_ms": transcribe_duration_ms,
+                    "rtf": rtf,
+                    "effective_speed_x": effective_speed_x,
+                },
+            )
+            self._emit_sla_event_if_needed(
+                rtf=rtf,
+                job_id=job_id,
+                stage=JobStage.COMPLETED,
+                rescue_used=pipeline_result.rescue_window_count > 0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            wall_duration_ms = int((time.perf_counter() - started_wall_time) * 1000)
+            self._log_event(
+                event="stage_failed",
+                job_id=job_id,
+                stage=JobStage.FAILED,
+                status=JobStatus.FAILED,
+                progress=100.0,
+                error_code=self._infer_error_code(exc),
+                error_message=self._safe_error_message(exc),
+                extra_fields={"failed_stage": "pipeline"},
+            )
+            with get_connection() as conn:
+                status_message = "Ошибка обработки"
+                if isinstance(exc, AudioPreprocessError):
+                    status_message = "Ошибка подготовки аудио"
+                self._update_job(
+                    conn=conn,
+                    job_id=job_id,
+                    status=JobStatus.FAILED,
+                    stage=JobStage.FAILED,
+                    progress=100.0,
+                    status_message=status_message,
+                    finished_at=utc_now_iso(),
+                    error=str(exc),
+                    error_code=self._infer_error_code(exc),
+                    processing_duration_ms=wall_duration_ms,
+                    preprocess_duration_ms=preprocess_duration_ms,
+                    decode_duration_ms=decode_duration_ms,
+                    transcribe_duration_ms=transcribe_duration_ms,
+                    persist_duration_ms=persist_duration_ms,
+                    prepared_audio_path=(
+                        prepared_audio_path if self.settings.preprocess.keep_prepared_audio else None
+                    ),
+                    quality_flags=quality_flags_json,
+                )
+            self._log_event(
+                event="job_failed",
+                job_id=job_id,
+                stage=JobStage.FAILED,
+                status=JobStatus.FAILED,
+                progress=100.0,
+                duration_ms=wall_duration_ms,
+                error_code=self._infer_error_code(exc),
+                error_message=self._safe_error_message(exc),
+            )
+        finally:
+            cleanup_prepared_audio(
+                prepared_audio_path,
+                keep_prepared_audio=self.settings.preprocess.keep_prepared_audio,
+            )
+            self._log_resource_snapshot(job_id=job_id, stage=JobStage.COMPLETED, force=True)
+            reset_log_context(log_context_token)
+
+    def _update_job(
+        self,
+        conn,
+        job_id: str,
+        *,
+        status: JobStatus | None = None,
+        stage: JobStage | None = None,
+        progress: float | None = None,
+        status_message: str | None = None,
+        started_at: str | None = None,
+        finished_at: str | None = None,
+        error: str | None = None,
+        error_code: str | None = None,
+        duration_sec: float | None = None,
+        processing_duration_ms: int | None = None,
+        transcribe_duration_ms: int | None = None,
+        preprocess_duration_ms: int | None = None,
+        decode_duration_ms: int | None = None,
+        enhance_duration_ms: int | None = None,
+        segment_duration_ms: int | None = None,
+        decorate_duration_ms: int | None = None,
+        persist_duration_ms: int | None = None,
+        prepared_audio_path: str | None = None,
+        quality_flags: str | None = None,
+        clear_error: bool = False,
+    ) -> None:
+        fields: list[str] = []
+        values: list[object] = []
+        updates = {
+            "status": status,
+            "stage": stage,
+            "progress": progress,
+            "status_message": status_message,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "error": error,
+            "error_code": error_code,
+            "duration_sec": duration_sec,
+            "processing_duration_ms": processing_duration_ms,
+            "transcribe_duration_ms": transcribe_duration_ms,
+            "preprocess_duration_ms": preprocess_duration_ms,
+            "decode_duration_ms": decode_duration_ms,
+            "enhance_duration_ms": enhance_duration_ms,
+            "segment_duration_ms": segment_duration_ms,
+            "decorate_duration_ms": decorate_duration_ms,
+            "persist_duration_ms": persist_duration_ms,
+            "prepared_audio_path": prepared_audio_path,
+            "quality_flags": quality_flags,
+        }
+        for key, value in updates.items():
+            if value is not None:
+                fields.append(f"{key} = ?")
+                values.append(value)
+        if clear_error:
+            fields.append("error = NULL")
+            fields.append("error_code = NULL")
+        if not fields:
+            return
+        values.append(job_id)
+        conn.execute(
+            f"""
+            UPDATE transcription_jobs
+            SET {", ".join(fields)}
+            WHERE id = ?
+            """,
+            values,
+        )
+
+    def _infer_error_code(self, exc: Exception) -> str:
+        if isinstance(exc, AudioPreprocessError):
+            return "AUDIO_PREPROCESS_FAILED"
+        message = str(exc).lower()
+        if "cuda" in message or "out of memory" in message:
+            return "MODEL_RUNTIME_ERROR"
+        if "no such file" in message or "not found" in message:
+            return "AUDIO_FILE_NOT_FOUND"
+        if "sqlite" in message or "database" in message:
+            return "DB_WRITE_FAILED"
+        return "TRANSCRIPTION_FAILED"
+
+    def _safe_error_message(self, exc: Exception) -> str:
+        if isinstance(exc, AudioPreprocessError):
+            return "Audio preprocessing failed"
+        return type(exc).__name__
+
+    def _emit_sla_event_if_needed(
+        self,
+        *,
+        rtf: float | None,
+        job_id: str,
+        stage: JobStage,
+        rescue_used: bool,
+    ) -> None:
+        if rtf is None or rtf <= self.sla_rtf_threshold:
+            return
+        reason_code = "decode_slowdown"
+        queue_stats = get_queue_stats()
+        if queue_stats["queued"] > 0:
+            reason_code = "cpu_saturation"
+        if rescue_used:
+            reason_code = "audio_complexity_high"
+        self._log_event(
+            event="sla_drift_detected",
+            job_id=job_id,
+            stage=stage,
+            status=JobStatus.DONE,
+            extra_fields={
+                "reason_code": reason_code,
+                "rtf": rtf,
+                "rtf_threshold": self.sla_rtf_threshold,
+                "queue_backlog": queue_stats["queued"],
+                "processing_jobs": queue_stats["processing"],
+                "rescue_used": rescue_used,
+            },
+        )
+
+    def _log_resource_snapshot(self, *, job_id: str, stage: JobStage, force: bool = False) -> None:
+        if psutil is None:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_resource_snapshot_ts) < self.resource_snapshot_interval_sec:
+            return
+        self._last_resource_snapshot_ts = now
+
+        process = psutil.Process(os.getpid())
+        mem = process.memory_info()
+        cpu_percent = process.cpu_percent(interval=None)
+        num_threads = process.num_threads()
+        open_files_count = len(process.open_files())
+        ctx_switches = process.num_ctx_switches()
+        max_rss_kb = None
+        if resource is not None:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            max_rss_kb = int(getattr(usage, "ru_maxrss", 0))
+        self._log_event(
+            event="worker_resource_snapshot",
+            job_id=job_id,
+            stage=stage,
+            extra_fields={
+                "worker_pid": os.getpid(),
+                "cpu_percent": cpu_percent,
+                "rss_bytes": mem.rss,
+                "vms_bytes": mem.vms,
+                "threads": num_threads,
+                "open_files_count": open_files_count,
+                "ctx_switches_voluntary": ctx_switches.voluntary,
+                "ctx_switches_involuntary": ctx_switches.involuntary,
+                "max_rss_kb": max_rss_kb,
+            },
+        )
+        high_watermark_mb = _safe_env_int("LOG_RESOURCE_RSS_WARN_MB", 12288, min_value=1)
+        if mem.rss > high_watermark_mb * 1024 * 1024:
+            self._log_event(
+                event="resource_pressure_warning",
+                job_id=job_id,
+                stage=stage,
+                status=JobStatus.PROCESSING,
+                extra_fields={
+                    "reason_code": "rss_high_watermark",
+                    "rss_bytes": mem.rss,
+                    "rss_warn_mb": high_watermark_mb,
+                },
+            )
+
+    def _log_event(
+        self,
+        *,
+        event: str,
+        job_id: str,
+        stage: JobStage,
+        status: JobStatus | None = None,
+        progress: float | None = None,
+        duration_ms: int | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        queue_size: int | None = None,
+        segment_count: int | None = None,
+        audio_duration_sec: float | None = None,
+        persist_duration_ms: int | None = None,
+        extra_fields: dict[str, object] | None = None,
+    ) -> None:
+        payload = {
+            "event": event,
+            "job_id": job_id,
+            "stage": str(stage),
+            "status": str(status) if status else None,
+            "progress": progress,
+            "duration_ms": duration_ms,
+            "error_code": error_code,
+            "error_message": error_message,
+            "queue_size": queue_size,
+            "segment_count": segment_count,
+            "audio_duration_sec": audio_duration_sec,
+            "persist_duration_ms": persist_duration_ms,
+        }
+        if extra_fields:
+            payload.update(extra_fields)
+        clean_payload = {key: value for key, value in payload.items() if value is not None}
+        clean_payload.pop("event", None)
+        log_event(
+            self.logger,
+            event=event,
+            component="worker.pipeline",
+            **clean_payload,
+        )
 import asyncio
 import inspect
 import json
 import logging
 import math
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -150,6 +809,25 @@ class QualityGuardError(RuntimeError):
 
 
 LABEL_SPEECH = "speech"
+_TEXT_NORMALIZE_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
+_TEXT_SPACES_RE = re.compile(r"\s+")
+
+
+def normalize_transcript_text(text: str) -> str:
+    normalized = _TEXT_NORMALIZE_RE.sub(" ", text.casefold())
+    return _TEXT_SPACES_RE.sub(" ", normalized).strip()
+
+
+def token_jaccard_similarity(left: str, right: str) -> float:
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    left_tokens = set(left.split())
+    right_tokens = set(right.split())
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
 
 
 class TranscriptionWorker:
@@ -234,33 +912,138 @@ class TranscriptionWorker:
             default=2.4,
         )
         self.enable_quality_fallback = getenv_bool("WHISPER_ENABLE_QUALITY_FALLBACK", True)
+        self.strict_quality_guard = getenv_bool("WHISPER_STRICT_QUALITY_GUARD", False)
         self.min_unique_ratio = getenv_float("WHISPER_MIN_UNIQUE_SEGMENT_RATIO", 0.25)
         self.max_top_repeat_ratio = getenv_float("WHISPER_MAX_TOP_REPEAT_RATIO", 0.7)
         self.max_prompt_match_ratio = getenv_float("WHISPER_MAX_PROMPT_MATCH_RATIO", 0.5)
+        self.near_duplicate_similarity_threshold = clamp_config_float(
+            "WHISPER_NEAR_DUPLICATE_SIMILARITY_THRESHOLD",
+            getenv_float("WHISPER_NEAR_DUPLICATE_SIMILARITY_THRESHOLD", 0.82),
+            min_value=0.0,
+            max_value=1.0,
+            default=0.82,
+        )
+        self.max_near_duplicate_ratio = clamp_config_float(
+            "WHISPER_MAX_NEAR_DUPLICATE_RATIO",
+            getenv_float("WHISPER_MAX_NEAR_DUPLICATE_RATIO", 0.65),
+            min_value=0.0,
+            max_value=1.0,
+            default=0.65,
+        )
+        self.max_near_duplicate_run = ensure_config_min_int(
+            "WHISPER_MAX_NEAR_DUPLICATE_RUN",
+            getenv_int("WHISPER_MAX_NEAR_DUPLICATE_RUN", 4),
+            min_value=2,
+            default=4,
+        )
+        self.fallback_prompt_mode = normalize_choice(
+            "WHISPER_FALLBACK_PROMPT_MODE",
+            os.getenv("WHISPER_FALLBACK_PROMPT_MODE", "drop"),
+            {"drop", "keep"},
+            "drop",
+        )
+        self.fallback_condition_on_previous_text = getenv_bool(
+            "WHISPER_FALLBACK_CONDITION_ON_PREVIOUS_TEXT",
+            False,
+        )
         self.preprocess_sample_rate = getenv_int("WHISPER_PREPROCESS_SAMPLE_RATE", 16000)
         self.preprocess_timeout_sec = getenv_int("WHISPER_PREPROCESS_TIMEOUT_SEC", 1800)
         self.enhance_profile = normalize_choice(
             "WHISPER_ENHANCE_PROFILE",
             os.getenv("WHISPER_ENHANCE_PROFILE", "balanced"),
-            {"off", "balanced", "aggressive"},
+            {"off", "balanced", "aggressive", "lecture"},
             "balanced",
         )
-        self.long_audio_min_sec = max(0, getenv_int("WHISPER_LONG_AUDIO_MIN_SEC", 3600))
+        self.long_audio_min_sec = max(0, getenv_int("WHISPER_LONG_AUDIO_MIN_SEC", 1800))
         self.long_audio_chunk_sec = max(60, getenv_int("WHISPER_LONG_AUDIO_CHUNK_SEC", 900))
         self.long_audio_overlap_sec = max(
             0.0,
             min(
                 float(self.long_audio_chunk_sec - 5),
-                getenv_float("WHISPER_LONG_AUDIO_OVERLAP_SEC", 2.0),
+                getenv_float("WHISPER_LONG_AUDIO_OVERLAP_SEC", 6.0),
             ),
         )
+        self.chunk_prompt_first_only = getenv_bool("WHISPER_CHUNK_PROMPT_FIRST_ONLY", True)
+        self.chunk_condition_on_previous_text = getenv_bool(
+            "WHISPER_CHUNK_CONDITION_ON_PREVIOUS_TEXT",
+            False,
+        )
+        self.chunk_boundary_similarity_threshold = clamp_config_float(
+            "WHISPER_CHUNK_BOUNDARY_SIMILARITY_THRESHOLD",
+            getenv_float("WHISPER_CHUNK_BOUNDARY_SIMILARITY_THRESHOLD", 0.85),
+            min_value=0.0,
+            max_value=1.0,
+            default=0.85,
+        )
+        self.chunk_boundary_window_sec = ensure_config_min_float(
+            "WHISPER_CHUNK_BOUNDARY_WINDOW_SEC",
+            getenv_float("WHISPER_CHUNK_BOUNDARY_WINDOW_SEC", 3.0),
+            min_value=0.1,
+            default=3.0,
+        )
         self.chunk_length_s = max(1, getenv_int("WHISPER_CHUNK_LENGTH_S", 20))
+        self.filter_artifact_texts = getenv_bool("WHISPER_FILTER_ARTIFACT_TEXTS", True)
+        self.drop_filtered_segments = getenv_bool("WHISPER_DROP_FILTERED_SEGMENTS", True)
+        self.filter_no_speech_prob = clamp_config_float(
+            "WHISPER_FILTER_NO_SPEECH_PROB",
+            getenv_float("WHISPER_FILTER_NO_SPEECH_PROB", 0.92),
+            min_value=0.0,
+            max_value=1.0,
+            default=0.92,
+        )
+        self.filter_min_confidence = clamp_config_float(
+            "WHISPER_FILTER_MIN_CONFIDENCE",
+            getenv_float("WHISPER_FILTER_MIN_CONFIDENCE", 0.03),
+            min_value=0.0,
+            max_value=1.0,
+            default=0.03,
+        )
+        self.filter_min_logprob = ensure_finite_float(
+            "WHISPER_FILTER_MIN_LOGPROB",
+            getenv_float("WHISPER_FILTER_MIN_LOGPROB", -2.7),
+            -2.7,
+        )
+        self.filter_max_compression_ratio = ensure_config_min_float(
+            "WHISPER_FILTER_MAX_COMPRESSION_RATIO",
+            getenv_float("WHISPER_FILTER_MAX_COMPRESSION_RATIO", 3.4),
+            min_value=0.0,
+            default=3.4,
+        )
+        self.artifact_regexes = self._compile_artifact_regexes(
+            os.getenv("WHISPER_ARTIFACT_REGEXES", "")
+        )
         self.keep_prepared_audio = getenv_bool("WHISPER_KEEP_PREPARED_AUDIO", True)
         self.sla_rtf_threshold = max(0.01, getenv_float("WHISPER_SLA_RTF_THRESHOLD", 0.25))
         self.resource_snapshot_interval_sec = max(
             1, getenv_int("LOG_SNAPSHOT_INTERVAL_SEC", 10)
         )
         self._last_resource_snapshot_ts = 0.0
+
+    def _compile_artifact_regexes(self, raw_value: str) -> list[re.Pattern[str]]:
+        default_patterns = [
+            r"\bсубтитр(?:ы|ов)?\s+сделал[аи]?\b",
+            r"\bsubtitles?\s+by\b",
+            r"\bпродолжени[ея]\s+следует\b",
+            r"\bthanks\s+for\s+watching\b",
+            r"\bamara\.org\b",
+        ]
+        patterns = default_patterns
+        if raw_value.strip():
+            parsed_patterns = [item.strip() for item in raw_value.split("||") if item.strip()]
+            if parsed_patterns:
+                patterns = parsed_patterns
+        compiled: list[re.Pattern[str]] = []
+        for pattern in patterns:
+            try:
+                compiled.append(re.compile(pattern, flags=re.IGNORECASE))
+            except re.error:
+                _warn_config(
+                    "WHISPER_ARTIFACT_REGEXES",
+                    pattern,
+                    "ignored",
+                    "invalid_regex",
+                )
+        return compiled
 
     def process_claimed_job(self, job_id: str) -> None:
         asyncio.run(self._process_job(job_id))
@@ -387,6 +1170,14 @@ class TranscriptionWorker:
                 "afftdn=nf=-20",
                 "dynaudnorm=f=100:g=23",
             ]
+        if self.enhance_profile == "lecture":
+            # Lecture profile keeps speech frequencies while being gentler on music-heavy parts.
+            return [
+                "highpass=f=65",
+                "lowpass=f=7600",
+                "afftdn=nf=-28",
+                "dynaudnorm=f=180:g=12",
+            ]
         return [
             "highpass=f=80",
             "lowpass=f=7800",
@@ -479,6 +1270,60 @@ class TranscriptionWorker:
             progress=100.0,
         )
 
+    def _segment_confidence(self, avg_logprob: float) -> float:
+        return max(0.0, min(1.0, math.exp(min(0.0, avg_logprob))))
+
+    def _segment_quality_key(self, segment: dict[str, float | str]) -> tuple[float, float, float]:
+        avg_logprob = float(segment.get("avg_logprob", -10.0))
+        no_speech_prob = float(segment.get("no_speech_prob", 1.0))
+        compression_ratio = float(segment.get("compression_ratio", 10.0))
+        return (avg_logprob, -no_speech_prob, -compression_ratio)
+
+    def _is_boundary_duplicate(
+        self,
+        previous_row: dict[str, float | str],
+        row: dict[str, float | str],
+        *,
+        start_sec: float,
+    ) -> bool:
+        prev_text = normalize_transcript_text(str(previous_row.get("text", "")))
+        curr_text = normalize_transcript_text(str(row.get("text", "")))
+        if not prev_text or not curr_text:
+            return False
+        similarity = token_jaccard_similarity(prev_text, curr_text)
+        if similarity < self.chunk_boundary_similarity_threshold:
+            return False
+        previous_start = max(0.0, float(previous_row.get("start_sec", 0.0)))
+        previous_end = max(previous_start, float(previous_row.get("end_sec", previous_start)))
+        overlap_sec = previous_end - start_sec
+        boundary_window = max(self.chunk_boundary_window_sec, self.long_audio_overlap_sec + 1.0)
+        return overlap_sec > 0.0 or abs(start_sec - previous_start) <= boundary_window
+
+    def _segment_filter_reasons(
+        self,
+        segment: dict[str, float | str],
+        *,
+        text: str,
+        confidence: float,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if self.filter_artifact_texts and text:
+            for pattern in self.artifact_regexes:
+                if pattern.search(text):
+                    reasons.append("ARTIFACT_TEXT_PATTERN")
+                    break
+        avg_logprob = float(segment.get("avg_logprob", 0.0))
+        no_speech_prob = float(segment.get("no_speech_prob", 0.0))
+        compression_ratio = float(segment.get("compression_ratio", 0.0))
+        if no_speech_prob >= self.filter_no_speech_prob and confidence <= self.filter_min_confidence:
+            reasons.append("LOW_CONFIDENCE_NO_SPEECH")
+        if (
+            compression_ratio >= self.filter_max_compression_ratio
+            and avg_logprob <= self.filter_min_logprob
+        ):
+            reasons.append("HIGH_COMPRESSION_LOW_LOGPROB")
+        return reasons
+
     def _analyze_quality(
         self,
         segment_rows: list[dict[str, float | str]],
@@ -491,39 +1336,67 @@ class TranscriptionWorker:
                 "unique_ratio": 0.0,
                 "top_repeat_ratio": 0.0,
                 "prompt_match_ratio": 0.0,
+                "near_duplicate_ratio": 0.0,
+                "max_near_duplicate_run": 0,
                 "top_repeat_text": None,
                 "reasons": ["NO_SEGMENTS"],
                 "is_anomaly": True,
             }
 
-        texts = [
-            str(segment["text"]).strip()
-            for segment in segment_rows
-            if str(segment.get("text", "")).strip()
-        ]
-        if not texts:
+        normalized_texts: list[str] = []
+        normalized_examples: dict[str, str] = {}
+        for segment in segment_rows:
+            raw_text = str(segment.get("text", "")).strip()
+            if not raw_text:
+                continue
+            normalized_text = normalize_transcript_text(raw_text)
+            if not normalized_text:
+                continue
+            normalized_texts.append(normalized_text)
+            normalized_examples.setdefault(normalized_text, raw_text)
+        if not normalized_texts:
             return {
                 "segment_count": len(segment_rows),
                 "unique_text_count": 0,
                 "unique_ratio": 0.0,
                 "top_repeat_ratio": 0.0,
                 "prompt_match_ratio": 0.0,
+                "near_duplicate_ratio": 0.0,
+                "max_near_duplicate_run": 0,
                 "top_repeat_text": None,
                 "reasons": ["EMPTY_SEGMENTS"],
                 "is_anomaly": True,
             }
 
-        counts = Counter(texts)
-        top_text, top_count = counts.most_common(1)[0]
-        segment_count = len(texts)
+        counts = Counter(normalized_texts)
+        top_text_normalized, top_count = counts.most_common(1)[0]
+        segment_count = len(normalized_texts)
         unique_count = len(counts)
         unique_ratio = unique_count / segment_count
         top_repeat_ratio = top_count / segment_count
         prompt_match_ratio = 0.0
-        normalized_prompt = prompt.strip() if prompt else None
+        normalized_prompt = normalize_transcript_text(prompt) if prompt else None
         if normalized_prompt:
-            prompt_hits = sum(1 for text in texts if text == normalized_prompt)
+            prompt_hits = sum(1 for text in normalized_texts if text == normalized_prompt)
             prompt_match_ratio = prompt_hits / segment_count
+
+        adjacent_near_duplicates = 0
+        max_near_duplicate_run = 1
+        current_near_duplicate_run = 1
+        for previous_text, current_text in zip(normalized_texts, normalized_texts[1:]):
+            similarity = token_jaccard_similarity(previous_text, current_text)
+            if similarity >= self.near_duplicate_similarity_threshold:
+                adjacent_near_duplicates += 1
+                current_near_duplicate_run += 1
+                max_near_duplicate_run = max(
+                    max_near_duplicate_run,
+                    current_near_duplicate_run,
+                )
+            else:
+                current_near_duplicate_run = 1
+        near_duplicate_ratio = (
+            adjacent_near_duplicates / max(1, segment_count - 1) if segment_count > 1 else 0.0
+        )
 
         reasons: list[str] = []
         if unique_ratio < self.min_unique_ratio:
@@ -532,6 +1405,10 @@ class TranscriptionWorker:
             reasons.append("HIGH_TOP_REPEAT_RATIO")
         if normalized_prompt and prompt_match_ratio > self.max_prompt_match_ratio:
             reasons.append("HIGH_PROMPT_MATCH_RATIO")
+        if near_duplicate_ratio > self.max_near_duplicate_ratio:
+            reasons.append("HIGH_NEAR_DUPLICATE_RATIO")
+        if max_near_duplicate_run >= self.max_near_duplicate_run:
+            reasons.append("LONG_NEAR_DUPLICATE_RUN")
 
         return {
             "segment_count": segment_count,
@@ -539,32 +1416,56 @@ class TranscriptionWorker:
             "unique_ratio": round(unique_ratio, 4),
             "top_repeat_ratio": round(top_repeat_ratio, 4),
             "prompt_match_ratio": round(prompt_match_ratio, 4),
-            "top_repeat_text": top_text,
+            "near_duplicate_ratio": round(near_duplicate_ratio, 4),
+            "max_near_duplicate_run": max_near_duplicate_run,
+            "top_repeat_text": normalized_examples.get(top_text_normalized, top_text_normalized),
             "reasons": reasons,
             "is_anomaly": bool(reasons),
         }
+
+    def _handle_quality_guard_anomaly(
+        self,
+        *,
+        source: str,
+        reasons: list[str],
+        quality_payload: dict[str, object],
+    ) -> None:
+        normalized_reasons = [str(reason) for reason in reasons if str(reason).strip()]
+        reason_text = ",".join(normalized_reasons) or "UNKNOWN_QUALITY_REASON"
+        if self.strict_quality_guard:
+            if source == "primary":
+                raise QualityGuardError(f"quality guard failed: {reason_text}")
+            raise QualityGuardError(f"quality guard fallback failed: {reason_text}")
+        quality_payload["soft_fail_applied"] = True
+        quality_payload["soft_fail_source"] = source
+        quality_payload["soft_fail_reasons"] = normalized_reasons
 
     def _asr_segment_to_timeline_item(
         self,
         start_sec: float,
         end_sec: float,
         segment: dict[str, float | str],
+        *,
+        filter_reasons: list[str] | None = None,
     ) -> dict[str, object]:
         text = str(segment.get("text", "")).strip()
         avg_logprob = float(segment.get("avg_logprob", 0.0))
         label = LABEL_SPEECH
-        confidence = max(0.0, min(1.0, math.exp(min(0.0, avg_logprob))))
+        confidence = self._segment_confidence(avg_logprob)
+        quality_flags: dict[str, object] = {
+            "avg_logprob": round(avg_logprob, 4),
+            "no_speech_prob": round(float(segment.get("no_speech_prob", 0.0)), 4),
+            "compression_ratio": round(float(segment.get("compression_ratio", 0.0)), 4),
+        }
+        if filter_reasons:
+            quality_flags["filter_reasons"] = filter_reasons
         return {
             "start_sec": start_sec,
             "end_sec": end_sec,
             "label": label,
             "text": text,
             "confidence": round(confidence, 4),
-            "quality_flags": {
-                "avg_logprob": round(avg_logprob, 4),
-                "no_speech_prob": round(float(segment.get("no_speech_prob", 0.0)), 4),
-                "compression_ratio": round(float(segment.get("compression_ratio", 0.0)), 4),
-            },
+            "quality_flags": quality_flags,
         }
 
     def _build_chunk_plan(self, audio_duration_sec: float) -> list[tuple[float, float]]:
@@ -653,11 +1554,19 @@ class TranscriptionWorker:
                     start_sec,
                     end_sec,
                 )
+                chunk_prompt = prompt
+                if self.chunk_prompt_first_only and chunk_idx > 0:
+                    chunk_prompt = None
+                chunk_condition_on_previous_text = (
+                    condition_on_previous_text
+                    if chunk_idx == 0
+                    else self.chunk_condition_on_previous_text
+                )
                 chunk_rows, _ = await self._run_transcribe(
                     model,
                     chunk_path,
-                    prompt,
-                    condition_on_previous_text,
+                    chunk_prompt,
+                    chunk_condition_on_previous_text,
                 )
                 for row in chunk_rows:
                     merged_rows.append(
@@ -665,6 +1574,7 @@ class TranscriptionWorker:
                             **row,
                             "start_sec": max(0.0, float(row["start_sec"]) + start_sec),
                             "end_sec": max(0.0, float(row["end_sec"]) + start_sec),
+                            "chunk_idx": chunk_idx,
                         }
                     )
         merged_rows.sort(key=lambda item: (float(item["start_sec"]), float(item["end_sec"])))
@@ -672,16 +1582,42 @@ class TranscriptionWorker:
         for row in merged_rows:
             start_sec = max(0.0, float(row["start_sec"]))
             end_sec = max(start_sec, float(row["end_sec"]))
+            normalized_row = {**row, "start_sec": start_sec, "end_sec": end_sec}
             if not deduped:
-                deduped.append({**row, "start_sec": start_sec, "end_sec": end_sec})
+                deduped.append(normalized_row)
                 continue
-            last_end = float(deduped[-1]["end_sec"])
-            if end_sec <= last_end:
+            previous_row = deduped[-1]
+            previous_end = float(previous_row["end_sec"])
+            if end_sec <= previous_end:
+                if (
+                    self._is_boundary_duplicate(previous_row, normalized_row, start_sec=start_sec)
+                    and self._segment_quality_key(normalized_row)
+                    > self._segment_quality_key(previous_row)
+                ):
+                    normalized_row["start_sec"] = float(previous_row["start_sec"])
+                    deduped[-1] = normalized_row
                 continue
-            if start_sec < last_end:
-                start_sec = last_end
-            deduped.append({**row, "start_sec": start_sec, "end_sec": end_sec})
-        return deduped, {"duration": audio_duration_sec}
+            if self._is_boundary_duplicate(previous_row, normalized_row, start_sec=start_sec):
+                if (
+                    self._segment_quality_key(normalized_row)
+                    <= self._segment_quality_key(previous_row)
+                ):
+                    continue
+                normalized_row["start_sec"] = min(start_sec, float(previous_row["start_sec"]))
+                deduped[-1] = normalized_row
+                continue
+            if start_sec < previous_end:
+                start_sec = previous_end
+                if start_sec >= end_sec:
+                    continue
+                normalized_row["start_sec"] = start_sec
+            deduped.append(normalized_row)
+        cleaned_rows = []
+        for row in deduped:
+            row_copy = dict(row)
+            row_copy.pop("chunk_idx", None)
+            cleaned_rows.append(row_copy)
+        return cleaned_rows, {"duration": audio_duration_sec}
 
     def _decorate_segments(
         self,
@@ -690,6 +1626,9 @@ class TranscriptionWorker:
         _audio_duration_sec: float,
     ) -> tuple[list[dict[str, object]], dict[str, object]]:
         decorated: list[dict[str, object]] = []
+        filtered_reason_counts: Counter[str] = Counter()
+        filtered_segments = 0
+        kept_filtered_segments = 0
         for segment in sorted(
             raw_segments,
             key=lambda item: (
@@ -702,7 +1641,27 @@ class TranscriptionWorker:
             text = str(segment.get("text", "")).strip()
             if not text:
                 continue
-            decorated.append(self._asr_segment_to_timeline_item(start_sec, end_sec, segment))
+            confidence = self._segment_confidence(float(segment.get("avg_logprob", 0.0)))
+            filter_reasons = self._segment_filter_reasons(
+                segment,
+                text=text,
+                confidence=confidence,
+            )
+            if filter_reasons:
+                filtered_segments += 1
+                for reason in filter_reasons:
+                    filtered_reason_counts[reason] += 1
+                if self.drop_filtered_segments:
+                    continue
+                kept_filtered_segments += 1
+            decorated.append(
+                self._asr_segment_to_timeline_item(
+                    start_sec,
+                    end_sec,
+                    segment,
+                    filter_reasons=filter_reasons or None,
+                )
+            )
 
         return decorated, {
             "inserted_labels": {
@@ -712,6 +1671,10 @@ class TranscriptionWorker:
                 "speech": len(decorated),
             },
             "gap_metrics": [],
+            "filtered_segments": filtered_segments,
+            "kept_filtered_segments": kept_filtered_segments,
+            "filtered_reason_counts": dict(sorted(filtered_reason_counts.items())),
+            "drop_filtered_segments": self.drop_filtered_segments,
         }
 
     async def _process_job(self, job_id: str) -> None:
@@ -874,7 +1837,11 @@ class TranscriptionWorker:
             quality_primary = self._analyze_quality(primary_rows, self.initial_prompt)
             fallback_used = False
             raw_segment_rows = primary_rows
-            quality_payload: dict[str, object] = {"primary": quality_primary, "fallback_used": False}
+            quality_payload: dict[str, object] = {
+                "primary": quality_primary,
+                "fallback_used": False,
+                "strict_quality_guard": self.strict_quality_guard,
+            }
 
             if bool(quality_primary["is_anomaly"]):
                 self._log_event(
@@ -891,37 +1858,78 @@ class TranscriptionWorker:
                     },
                 )
                 if not self.enable_quality_fallback:
-                    raise QualityGuardError(
-                        f"quality guard failed: {','.join(quality_primary['reasons'])}"
+                    self._handle_quality_guard_anomaly(
+                        source="primary",
+                        reasons=list(quality_primary["reasons"]),
+                        quality_payload=quality_payload,
                     )
-                fallback_used = True
-                fallback_rows, info = await self._transcribe_with_chunking(
-                    model,
-                    prepared_audio_path or audio_path,
-                    None,
-                    False,
-                    source_duration_sec or 0.0,
-                )
-                quality_fallback = self._analyze_quality(fallback_rows, None)
-                quality_payload["fallback_used"] = True
-                quality_payload["fallback"] = quality_fallback
-                if bool(quality_fallback["is_anomaly"]):
-                    raise QualityGuardError(
-                        f"quality guard fallback failed: {','.join(quality_fallback['reasons'])}"
+                    self._log_event(
+                        event="quality_guard_softened",
+                        job_id=job_id,
+                        stage=JobStage.TRANSCRIBING,
+                        status=JobStatus.PROCESSING,
+                        progress=72.0,
+                        extra_fields={
+                            "source": "primary",
+                            "quality_reasons": ",".join(list(quality_primary["reasons"])),
+                            "strict_quality_guard": self.strict_quality_guard,
+                        },
                     )
-                raw_segment_rows = fallback_rows
-                self._log_event(
-                    event="quality_fallback_succeeded",
-                    job_id=job_id,
-                    stage=JobStage.TRANSCRIBING,
-                    status=JobStatus.PROCESSING,
-                    progress=75.0,
-                    extra_fields={
-                        "unique_ratio": quality_fallback["unique_ratio"],
-                        "top_repeat_ratio": quality_fallback["top_repeat_ratio"],
-                        "prompt_match_ratio": quality_fallback["prompt_match_ratio"],
-                    },
-                )
+                    quality_payload["selected_quality"] = "primary_soft_anomaly"
+                else:
+                    fallback_used = True
+                    fallback_prompt = (
+                        self.initial_prompt if self.fallback_prompt_mode == "keep" else None
+                    )
+                    fallback_rows, info = await self._transcribe_with_chunking(
+                        model,
+                        prepared_audio_path or audio_path,
+                        fallback_prompt,
+                        self.fallback_condition_on_previous_text,
+                        source_duration_sec or 0.0,
+                    )
+                    quality_fallback = self._analyze_quality(fallback_rows, fallback_prompt)
+                    quality_payload["fallback_used"] = True
+                    quality_payload["fallback"] = quality_fallback
+                    if bool(quality_fallback["is_anomaly"]):
+                        self._handle_quality_guard_anomaly(
+                            source="fallback",
+                            reasons=list(quality_fallback["reasons"]),
+                            quality_payload=quality_payload,
+                        )
+                        raw_segment_rows = fallback_rows
+                        self._log_event(
+                            event="quality_guard_softened",
+                            job_id=job_id,
+                            stage=JobStage.TRANSCRIBING,
+                            status=JobStatus.PROCESSING,
+                            progress=76.0,
+                            extra_fields={
+                                "source": "fallback",
+                                "quality_reasons": ",".join(list(quality_fallback["reasons"])),
+                                "strict_quality_guard": self.strict_quality_guard,
+                            },
+                        )
+                        quality_payload["fallback_soft_anomaly"] = quality_fallback
+                        quality_payload.pop("fallback", None)
+                        quality_payload["selected_quality"] = "fallback_soft_anomaly"
+                    else:
+                        raw_segment_rows = fallback_rows
+                        quality_payload["selected_quality"] = "fallback"
+                        self._log_event(
+                            event="quality_fallback_succeeded",
+                            job_id=job_id,
+                            stage=JobStage.TRANSCRIBING,
+                            status=JobStatus.PROCESSING,
+                            progress=75.0,
+                            extra_fields={
+                                "unique_ratio": quality_fallback["unique_ratio"],
+                                "top_repeat_ratio": quality_fallback["top_repeat_ratio"],
+                                "prompt_match_ratio": quality_fallback["prompt_match_ratio"],
+                            },
+                        )
+            else:
+                quality_payload["selected_quality"] = "primary"
 
             transcribe_duration_ms = int((time.perf_counter() - transcribe_started) * 1000)
             decorate_started = time.perf_counter()
@@ -985,6 +1993,8 @@ class TranscriptionWorker:
                     "tag_music_count": tagging_stats["inserted_labels"]["music"],
                     "tag_unclear_count": tagging_stats["inserted_labels"]["unclear"],
                     "speech_count": tagging_stats["inserted_labels"]["speech"],
+                    "filtered_segments": tagging_stats.get("filtered_segments", 0),
+                    "kept_filtered_segments": tagging_stats.get("kept_filtered_segments", 0),
                 },
             )
             persist_started = time.perf_counter()
@@ -1338,3 +2348,4 @@ class TranscriptionWorker:
             component="worker.pipeline",
             **clean_payload,
         )
+'''

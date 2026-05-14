@@ -157,18 +157,6 @@ export async function deleteJob(jobId) {
   );
 }
 
-export async function fetchStats({ from, to } = {}) {
-  const params = new URLSearchParams();
-  if (from) {
-    params.set("from", from);
-  }
-  if (to) {
-    params.set("to", to);
-  }
-  const query = params.toString();
-  return requestWithRetry(`/api/stats${query ? `?${query}` : ""}`, undefined, { retryCount: 2 });
-}
-
 export function getJobAudioUrl(jobId, variant = "original") {
   const params = new URLSearchParams({ variant });
   return `${API_BASE_URL}/api/jobs/${jobId}/audio?${params.toString()}`;

@@ -19,9 +19,6 @@ class SegmentOut(BaseModel):
 class JobBase(BaseModel):
     id: str
     original_filename: str
-    whisper_model_size: str | None = None
-    whisper_cpu_threads: int | None = None
-    whisper_beam_size: int | None = None
     status: str
     stage: str | None = None
     progress: float | None = None
@@ -35,11 +32,6 @@ class JobBase(BaseModel):
     processing_duration_ms: int | None = None
     transcribe_duration_ms: int | None = None
     preprocess_duration_ms: int | None = None
-    decode_duration_ms: int | None = None
-    enhance_duration_ms: int | None = None
-    segment_duration_ms: int | None = None
-    decorate_duration_ms: int | None = None
-    persist_duration_ms: int | None = None
     original_audio_url: str | None = None
     prepared_audio_url: str | None = None
     delete_requested: bool = False
