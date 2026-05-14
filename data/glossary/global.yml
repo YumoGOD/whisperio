@@ -1,91 +1,63 @@
 terms:
   - canonical: "Bauer"
-    category: "brand"
-    mode: "hard"
-    spoken_forms:
+    mode: hard
+    category: brand
+    forms:
       - "Бауэр"
       - "Бауер"
       - "компания Бауэр"
-    description: "Bauer — название компании, произносится как Бауэр и пишется латиницей."
-    replacements:
-      - from: "\\b[Бб]ауэр\\b"
-        to: "Bauer"
-      - from: "\\b[Бб]ауер\\b"
-        to: "Bauer"
+    note: "Название компании, произносится как Бауэр, пишется латиницей."
+    min_words: 4
 
   - canonical: "Дмитрий Канищев"
-    category: "person"
-    mode: "soft"
-    spoken_forms:
+    category: person
+    forms:
       - "Дмитрий Канищев"
       - "Канищев"
-    description: "Дмитрий Канищев — директор компании."
+    note: "Дмитрий Канищев — директор компании."
 
   - canonical: "Bauer Juicer Pro"
-    category: "product"
-    mode: "soft"
-    spoken_forms:
+    category: product
+    forms:
       - "Бауэр джусер про"
       - "Бауер джусер про"
       - "джусер про"
       - "соковыжималка Бауэр"
-    description: "Bauer Juicer Pro — соковыжималка Bauer."
-    replacements:
-      - from: "\\b[Бб]ау[эе]р\\s+[Дд]жусер\\s+[Пп]ро\\b"
-        to: "Bauer Juicer Pro"
-      - from: "\\b[Дд]жусер\\s+[Пп]ро\\b"
-        to: "Bauer Juicer Pro"
+    note: "Соковыжималка Bauer."
 
   - canonical: "Bauer Lounge Massage"
-    category: "product"
-    mode: "soft"
-    spoken_forms:
+    category: product
+    forms:
       - "Бауэр лаундж массаж"
       - "Бауэр лаундж мессаж"
       - "Бауер лаундж массаж"
       - "лаундж мессаж"
       - "массажная накидка"
       - "массажное кресло"
-    description: "Bauer Lounge Massage — массажная накидка или массажное кресло Bauer."
-    replacements:
-      - from: "\\b[Бб]ау[эе]р\\s+[Лл]аундж\\s+[Мм][еэ]сс?[аэ]ж\\b"
-        to: "Bauer Lounge Massage"
-      - from: "\\b[Лл]аундж\\s+[Мм][еэ]сс?[аэ]ж\\b"
-        to: "Bauer Lounge Massage"
+    note: "Массажная накидка или массажное кресло Bauer."
 
   - canonical: "ОБКЛ"
-    category: "abbreviation"
-    mode: "hard"
-    spoken_forms:
+    mode: hard
+    category: abbreviation
+    forms:
       - "о бэ ка эль"
       - "обкл"
       - "оборот на клиента на презентацию"
-    description: "ОБКЛ — оборот на клиента на презентацию."
-    replacements:
-      - from: "\\b[Оо]\\s*[Бб]э?\\s*[Кк]а?\\s*[Ээ]ль\\b"
-        to: "ОБКЛ"
-      - from: "\\b[Оо]бкл\\b"
-        to: "ОБКЛ"
+    note: "ОБКЛ — оборот на клиента на презентацию."
 
   - canonical: "СОП"
-    category: "abbreviation"
-    mode: "hard"
-    spoken_forms:
+    mode: hard
+    category: abbreviation
+    forms:
       - "соп"
       - "эс о пэ"
       - "средний оборот презентации"
-    description: "СОП — средний оборот презентации."
-    replacements:
-      - from: "\\b[Ээ]с\\s+[Оо]\\s+[Пп]э\\b"
-        to: "СОП"
-      - from: "\\b[Сс]оп\\b"
-        to: "СОП"
+    note: "СОП — средний оборот презентации."
 
   - canonical: "шерстяные постельные принадлежности"
-    category: "topic"
-    mode: "soft"
-    spoken_forms:
+    category: topic
+    forms:
       - "шерсть"
       - "шерстяные принадлежности"
       - "постельные принадлежности из шерсти"
-    description: "Направление лекций о шерстяных постельных принадлежностях и аксессуарах."
+    note: "Направление лекций о шерстяных постельных принадлежностях и аксессуарах."

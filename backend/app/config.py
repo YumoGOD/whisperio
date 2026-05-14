@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     glossary_hotwords_max: int = 80
     glossary_enable_hotwords: bool = False
     glossary_enable_hard_normalization: bool = True
+    glossary_hard_min_segment_words: int = 3
     glossary_repetition_compression_threshold: float = 4.0
 
     @property
