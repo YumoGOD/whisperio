@@ -48,29 +48,27 @@ def prepare_audio(input_path: Path, output_path: Path, settings: Settings) -> Pa
         return output_path
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    filters = [f"aresample={settings.target_sample_rate}"]
+    filters = []
     if settings.enable_loudnorm:
         filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
 
-    run_command(
-        [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-i",
-            str(input_path),
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            str(settings.target_sample_rate),
-            "-af",
-            ",".join(filters),
-            "-c:a",
-            "pcm_s16le",
-            str(output_path),
-        ]
-    )
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-i",
+        str(input_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(settings.target_sample_rate),
+    ]
+    if filters:
+        cmd += ["-af", ",".join(filters)]
+    cmd += ["-c:a", "pcm_s16le", str(output_path)]
+
+    run_command(cmd)
     return output_path
 
 
@@ -90,7 +88,7 @@ def extract_chunk(input_path: Path, output_path: Path, start: float, duration: f
             "-i",
             str(input_path),
             "-c:a",
-            "pcm_s16le",
+            "copy",
             str(output_path),
         ]
     )
