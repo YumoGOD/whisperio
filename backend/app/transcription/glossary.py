@@ -121,20 +121,20 @@ def parse_dynamic_terms(raw_text: str | None) -> list[GlossaryTerm]:
     if not raw_text:
         return []
     terms: list[GlossaryTerm] = []
-    for line_number, line in enumerate(raw_text.splitlines(), start=1):
+    for line in raw_text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        parts = [part.strip() for part in stripped.split("|")]
-        if len(parts) < 3:
-            logger.warning("Динамический термин пропущен, строка %s: %s", line_number, stripped)
+        parts = [part.strip() for part in stripped.split("|", 1)]
+        canonical = parts[0]
+        if not canonical:
             continue
-        canonical, mode, forms = parts[:3]
+        spoken_forms = [f.strip() for f in parts[1].split(",") if f.strip()] if len(parts) > 1 else []
         terms.append(
             GlossaryTerm(
                 canonical=canonical,
-                mode="hard" if mode.lower() == "hard" else "soft",
-                spoken_forms=[item.strip() for item in forms.split(",") if item.strip()],
+                mode="soft",
+                spoken_forms=spoken_forms,
                 category="dynamic",
                 source="dynamic",
             )
@@ -194,30 +194,16 @@ def glossary_tokens(text: str) -> list[str]:
 
 
 def build_prompt(settings: Settings, params: dict[str, Any], terms: list[GlossaryTerm]) -> str | None:
-    lines = [
-        "Это русскоязычная запись. Распознавай только то, что реально произнесено.",
-        "Если бренд, модель, имя, отдел, аббревиатура или термин действительно прозвучали, сохраняй указанное написание. Не вставляй термины из списка, если они не прозвучали.",
-    ]
-    audio_type = clip_text(params.get("audio_type"), 160)
-    audio_context = clip_text(params.get("audio_context"), settings.glossary_context_max_chars)
-    expected_content = clip_text(params.get("expected_content"), settings.glossary_context_max_chars)
-    if audio_type:
-        lines.append(f"Тип записи: {audio_type}.")
+    lines = ["Это русскоязычная запись. Распознавай только то, что реально произнесено."]
+    audio_context = str(params.get("audio_context") or "").strip()
+    expected_content = str(params.get("expected_content") or "").strip()
     if audio_context:
-        lines.append(f"Контекст записи: {audio_context}")
+        lines.append(f"Описание: {audio_context}")
     if expected_content:
-        lines.append(f"Ожидаемое наполнение: {expected_content}")
-
-    term_hints: list[str] = []
-    for term in terms:
-        if term.category == "abbreviation" and term.description:
-            term_hints.append(f"{term.canonical} — {term.description}")
-        else:
-            term_hints.append(term.canonical)
-
-    if term_hints:
-        lines.append("Возможные термины и написание: " + "; ".join(term_hints))
-
+        lines.append(f"Примерное содержание: {expected_content}")
+    if terms:
+        term_names = ", ".join(t.canonical for t in terms)
+        lines.append(f"Термины: {term_names}")
     prompt = "\n".join(lines)
     return clip_text(prompt, settings.glossary_prompt_max_chars) or None
 

@@ -32,9 +32,8 @@ def worker_id() -> str:
     return settings.worker_id or f"{socket.gethostname()}-{os.getpid()}"
 
 
-def process_job(job: Job, repo: JobRepository, worker_name: str) -> None:
+def process_job(job: Job, repo: JobRepository, worker_name: str, pipeline: TranscriptionPipeline) -> None:
     logger.info("Запуск задачи %s (%s)", job.id, job.original_filename)
-    pipeline = TranscriptionPipeline(settings)
 
     def progress(progress: float, stage: str) -> None:
         repo.update_progress(job.id, progress, status="running")
@@ -78,6 +77,10 @@ def main() -> None:
         settings.worker_concurrency,
         settings.worker_poll_seconds,
     )
+    # Модель загружается один раз при первом обращении к pipeline.model.
+    # ВАЖНО: CTranslate2 не потокобезопасен — один pipeline рассчитан на WORKER_CONCURRENCY=1.
+    # При concurrency > 1 каждому потоку нужен собственный экземпляр TranscriptionPipeline.
+    pipeline = TranscriptionPipeline(settings)
     active: set[Future] = set()
     with ThreadPoolExecutor(max_workers=max(1, settings.worker_concurrency)) as executor:
         while not stop_requested:
@@ -86,7 +89,7 @@ def main() -> None:
                 job = repo.claim_next_job(name)
                 if job is None:
                     break
-                active.add(executor.submit(process_job, job, repo, name))
+                active.add(executor.submit(process_job, job, repo, name, pipeline))
 
             if active:
                 done, active = wait(active, timeout=settings.worker_poll_seconds, return_when=FIRST_COMPLETED)

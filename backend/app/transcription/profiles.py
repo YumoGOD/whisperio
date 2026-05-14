@@ -8,40 +8,20 @@ from app.config import Settings
 
 PROFILES: dict[str, dict[str, Any]] = {
     "accuracy_first": {
+        # Зашумлённые лекции. Приоритет — полнота, безопасность границ сегментов.
+        # beam_size=5/patience=1.2 — расширенный поиск; condition_on_previous_text=False
+        # предотвращает галлюцинации на границах 30-секундных окон.
         "description": "Noisy lecture profile. Prefer recall and boundary safety over speed.",
         "beam_size": 5,
         "best_of": 5,
-        "patience": 1.2,
+        "patience": 1.0,
         "temperature": [0.0, 0.2, 0.4, 0.6],
         "compression_ratio_threshold": 2.4,
-        "log_prob_threshold": -1.2,
-        "no_speech_threshold": 0.85,
-        "condition_on_previous_text": False,
-        "word_timestamps": True,
-        "vad_filter": False,
-        "vad_parameters": {
-            "threshold": 0.35,
-            "min_silence_duration_ms": 1200,
-            "speech_pad_ms": 600,
-        },
-    },
-    "speed_balanced": {
-        "description": "Cleaner audio profile. Faster decoding with cautious VAD enabled.",
-        "beam_size": 3,
-        "best_of": 3,
-        "patience": 1.0,
-        "temperature": [0.0, 0.2],
-        "compression_ratio_threshold": 2.4,
         "log_prob_threshold": -1.0,
-        "no_speech_threshold": 0.75,
+        "no_speech_threshold": 0.60,
         "condition_on_previous_text": False,
-        "word_timestamps": True,
-        "vad_filter": True,
-        "vad_parameters": {
-            "threshold": 0.45,
-            "min_silence_duration_ms": 800,
-            "speech_pad_ms": 400,
-        },
+        "word_timestamps": False,
+        "vad_filter": False,
     },
 }
 

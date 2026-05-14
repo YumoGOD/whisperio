@@ -16,7 +16,7 @@ from app.transcription.pipeline import TranscriptionPipeline
 def main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark faster-whisper transcription on one local file.")
     parser.add_argument("audio_file", type=Path, help="Path to an audio/video file readable by ffmpeg.")
-    parser.add_argument("--profile", default=None, help="Transcription profile: accuracy_first or speed_balanced.")
+    parser.add_argument("--profile", default=None, help="Transcription profile (default: accuracy_first).")
     args = parser.parse_args()
 
     settings = get_settings()

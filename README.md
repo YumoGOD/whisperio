@@ -1,26 +1,22 @@
-# Local Transcriber
+# whisperio2
 
-Local app for transcribing long and noisy lecture recordings with timings. **A NVIDIA GPU is required** — the Docker image ships CUDA/cuDNN and the worker runs faster-whisper on CUDA only. Stack: FastAPI, SQLite, local files, ffmpeg, faster-whisper. No Redis, Celery, PostgreSQL, RabbitMQ or cloud service is required.
+Локальный транскрибатор длинных и зашумлённых аудиозаписей с временными метками. Стек: FastAPI + SQLite + ffmpeg + faster-whisper. Без Redis, Celery, PostgreSQL и облаков.
 
-## Features
+**Требуется NVIDIA GPU** — работает только на CUDA, CPU-режима нет.
 
-- Upload audio/video files readable by ffmpeg, including `mp3`, `wav`, `ogg`, `m4a`, `flac`, `webm`, `mp4`.
-- Store media and artifacts under `./data/uploads`, `./data/work`, `./data/transcripts`, `./data/logs`.
-- Run API and worker as separate Docker Compose services.
-- Resume unfinished work after worker restart by returning stale `running` jobs to `pending`.
-- Preprocess to mono 16 kHz WAV, optionally with ffmpeg loudness normalization.
-- Chunk long recordings with overlap to reduce word loss at boundaries.
-- Export `txt`, `json`, `srt`, `vtt` and timestamped `docx`.
-- Review the source audio in the browser and click timestamped transcript segments to seek playback.
-- Use a corporate glossary and per-job context to improve brand, product, person and abbreviation recognition.
-- Compare `accuracy_first` and `speed_balanced` profiles.
-- Benchmark one file and print real-time factor.
+---
 
-## GPU and Docker
+## Prerequisites
 
-The [Dockerfile](Dockerfile) uses `nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04`; inference is fixed to **CUDA** in code (no CPU path). On the host you need a recent **NVIDIA driver** and the **[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)**. In [docker-compose.yml](docker-compose.yml), the `worker` service has `gpus: all`; the API service does not use a GPU.
+| Требование | Подробности |
+|---|---|
+| NVIDIA GPU | VRAM ≥ 10 GB для `large-v3`; 6 GB для `medium` |
+| NVIDIA Driver | Актуальный (≥ 525 рекомендовано) |
+| NVIDIA Container Toolkit | [Инструкция](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) |
+| Docker + Compose | Docker Desktop (Windows/Mac) или Docker Engine (Linux) |
+| Windows | Docker Desktop с WSL2 и GPU-поддержкой в дистрибутиве |
 
-On **Windows**, use Docker Desktop with **WSL2** and GPU support in the distro; native Windows containers with GPU are limited.
+---
 
 ## Quick Start
 
@@ -29,86 +25,169 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Open `http://localhost:8000`, upload a file, and watch the job list. The first run downloads the faster-whisper model into `./data/models`, so it can be much slower than later runs.
+Откройте `http://localhost:8000`, загрузите файл и наблюдайте за очередью.
 
-To confirm the worker sees a GPU:
-
-```bash
-docker compose run --rm worker nvidia-smi
-```
-
-If the server has restricted internet or Hugging Face SSL errors, download the model once and use it as a local path:
+**Первый запуск** скачивает модель в `./data/models` — это медленно. Для offline-окружений скачайте модель заранее:
 
 ```bash
-docker compose run --rm worker python scripts/download_model.py large-v3 --output-dir /app/data/models/faster-whisper-large-v3
+docker compose run --rm worker python scripts/download_model.py large-v3 \
+  --output-dir /app/data/models/faster-whisper-large-v3
 ```
 
-Then set this in `.env`:
+Затем в `.env`:
 
 ```env
 WHISPER_MODEL=/app/data/models/faster-whisper-large-v3
 ```
 
-## API
+Проверить, что воркер видит GPU:
 
 ```bash
+docker compose run --rm worker nvidia-smi
+```
+
+---
+
+## Архитектура
+
+Два сервиса в Compose:
+
+- **api** — FastAPI, порт 8000, GPU не нужен
+- **worker** — обрабатывает очередь заданий, требует `gpus: all`
+
+Оба монтируют `./data` как `/app/data` — общее хранилище для загрузок, артефактов и БД.
+
+---
+
+## Web UI
+
+`http://localhost:8000` — полный интерфейс управления:
+
+- Загрузка файла с контекстом и глоссарием
+- Список заданий с прогрессом в реальном времени
+- Аудиоплеер с кликабельными временными метками сегментов
+- Поиск по тексту транскрипта
+- Скачивание в любом формате
+
+---
+
+## REST API
+
+| Метод | Путь | Описание |
+|---|---|---|
+| `POST` | `/api/jobs` | Создать задание (загрузка файла) |
+| `GET` | `/api/jobs` | Список заданий с пагинацией |
+| `GET` | `/api/jobs/{id}` | Статус и результат задания |
+| `GET` | `/api/jobs/{id}/audio` | Стриминг исходного аудио |
+| `GET` | `/api/jobs/{id}/download/{fmt}` | Скачать транскрипт |
+| `GET` | `/api/profiles` | Список профилей транскрипции |
+| `GET` | `/api/health` | Проверка работоспособности |
+
+Форматы скачивания `{fmt}`: `txt`, `json`, `srt`, `vtt`, `docx`.
+
+**Примеры:**
+
+```bash
+# Создать задание
 curl -F "file=@lecture.mp3" -F "profile=accuracy_first" http://localhost:8000/api/jobs
-curl http://localhost:8000/api/jobs
+
+# Проверить статус
 curl http://localhost:8000/api/jobs/<job_id>
-curl -OJ http://localhost:8000/api/jobs/<job_id>/audio
+
+# Скачать SRT
 curl -OJ http://localhost:8000/api/jobs/<job_id>/download/srt
+
+# Скачать DOCX
 curl -OJ http://localhost:8000/api/jobs/<job_id>/download/docx
 ```
 
-Download formats:
-
-- `GET /api/jobs/{job_id}/download/txt`
-- `GET /api/jobs/{job_id}/download/json`
-- `GET /api/jobs/{job_id}/download/srt`
-- `GET /api/jobs/{job_id}/download/vtt`
-- `GET /api/jobs/{job_id}/download/docx`
+---
 
 ## Configuration
 
-All important settings are controlled through `.env`.
+Все настройки через `.env` (скопируйте из `.env.example`).
 
-Important defaults:
+### App
 
-- `WHISPER_MODEL=large-v3`
-- `WHISPER_COMPUTE_TYPE=float16` (optional: `int8_float16` to reduce VRAM)
-- `WHISPER_LANGUAGE=ru`
-- `WHISPER_TASK=transcribe`
-- `WORKER_CONCURRENCY=1` (on one GPU usually leave at `1`)
-- `DEFAULT_PROFILE=accuracy_first`
-- `CHUNK_SECONDS=1800`
-- `CHUNK_OVERLAP_SECONDS=15`
-- `MAX_UPLOAD_MB=5120`
-- `GLOSSARY_PATH=/app/data/glossary/global.yml`
-- `GLOSSARY_ENABLE_HOTWORDS=false`
-- `GLOSSARY_ENABLE_HARD_NORMALIZATION=true`
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `APP_NAME` | `Локальный транскрибатор` | Название приложения |
+| `APP_ENV` | `local` | Окружение |
+| `APP_HOST` | `0.0.0.0` | Адрес FastAPI |
+| `APP_PORT` | `8000` | Порт FastAPI |
+| `MAX_UPLOAD_MB` | `5120` | Максимальный размер файла (МБ) |
+| `ALLOWED_EXTENSIONS` | `*` | Допустимые расширения; `*` = любые (ffmpeg — реальный фильтр) |
 
-Device is always **CUDA** in the application; choosing a GPU is done with `CUDA_VISIBLE_DEVICES` on the host or in Compose if needed.
+### Whisper
 
-`WHISPER_MODEL` can be either a model alias like `large-v3` or a local CTranslate2 model directory, for example `/app/data/models/faster-whisper-large-v3`. A local path prevents runtime downloads and is recommended for offline or unstable networks.
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `WHISPER_MODEL` | `large-v3` | Имя модели или путь к локальной CTranslate2-директории |
+| `WHISPER_DEVICE` | `cuda` | Устройство — только `cuda` |
+| `WHISPER_COMPUTE_TYPE` | `float16` | `float16` — стандарт; `int8_float16` — меньше VRAM |
+| `WHISPER_NUM_WORKERS` | `1` | Потоки загрузки данных внутри WhisperModel |
+| `WHISPER_DOWNLOAD_ROOT` | `/app/data/models` | Кэш моделей |
+| `WHISPER_LANGUAGE` | `ru` | ISO-код языка; пустая строка = автодетект |
+| `WHISPER_TASK` | `transcribe` | `transcribe` или `translate` (в EN) |
+| `DEFAULT_PROFILE` | `accuracy_first` | Профиль по умолчанию |
 
-`WHISPER_LANGUAGE=ru` fixes language detection to Russian, which is recommended for long Russian lectures because chunks will not randomly switch language. Set it to another ISO language code if needed, or leave it empty only if automatic language detection is required.
+`WHISPER_LANGUAGE=ru` рекомендуется для длинных русских записей — предотвращает случайное переключение языка в чанках.
 
-## Glossary And Job Context
+### Worker
 
-The global corporate glossary is stored in `./data/glossary/global.yml` and is applied to every job. It supports two modes:
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `WORKER_CONCURRENCY` | `1` | Параллельных заданий; на одной GPU обычно `1` |
+| `WORKER_POLL_SECONDS` | `5` | Интервал опроса очереди (с) |
+| `WORKER_STALE_RUNNING_MINUTES` | `30` | Таймаут зависших заданий до возврата в `pending` |
+| `WORKER_ID` | _(пусто)_ | ID воркера; auto-генерируется если не задан |
 
-- `soft`: term can be used in the Whisper prompt when relevant to the job context, but the recognized text is not rewritten.
-- `hard`: term can be used in the prompt and is also normalized after recognition using regex replacements.
+### Audio
 
-`hotwords` are disabled by default because they can be too aggressive on long noisy Russian recordings and may cause repeated glossary hallucinations at the beginning of a chunk. Enable them only after testing a short sample:
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `CHUNK_SECONDS` | `1800` | Длина чанка (с); 1800 = 30 мин |
+| `CHUNK_OVERLAP_SECONDS` | `15` | Перекрытие чанков для исключения потерь на границах |
+| `ENABLE_LOUDNORM` | `true` | Нормализация громкости через ffmpeg loudnorm |
+| `TARGET_SAMPLE_RATE` | `16000` | Частота дискретизации (Гц) |
 
-```env
-GLOSSARY_ENABLE_HOTWORDS=false
-GLOSSARY_PROMPT_MAX_CHARS=700
-GLOSSARY_REPETITION_COMPRESSION_THRESHOLD=4.0
-```
+### VAD (Voice Activity Detection)
 
-Example:
+Silero VAD встроен в faster-whisper. По умолчанию **выключен** — на записях с постоянным фоновым шумом VAD может срезать тихую речь. Используйте `ENABLE_LOUDNORM=true` вместо VAD для плохого аудио.
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `VAD_FILTER` | `false` | Включить VAD-фильтрацию |
+| `VAD_THRESHOLD` | `0.35` | Порог чувствительности (ниже = чувствительнее; Silero default = 0.5) |
+| `VAD_MIN_SILENCE_MS` | `1200` | Минимальная пауза для разреза (мс) |
+| `VAD_SPEECH_PAD_MS` | `600` | Паддинг вокруг речевых сегментов (мс) |
+
+Рекомендуемые настройки при `VAD_FILTER=true` для тихой речи: `VAD_THRESHOLD=0.25`, `VAD_SPEECH_PAD_MS=800`.
+
+### Glossary
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `GLOSSARY_PATH` | `/app/data/glossary/global.yml` | Путь к глобальному глоссарию |
+| `GLOSSARY_PROMPT_MAX_CHARS` | `700` | Максимальный размер промпта для Whisper (символов) |
+| `GLOSSARY_CONTEXT_MAX_CHARS` | `1200` | Максимальный размер контекстного блока (символов) |
+| `GLOSSARY_HOTWORDS_MAX` | `80` | Максимальное число hotwords |
+| `GLOSSARY_ENABLE_HOTWORDS` | `false` | Агрессивный boost терминов (может вызывать повторения) |
+| `GLOSSARY_ENABLE_HARD_NORMALIZATION` | `true` | Применять regex-замены после распознавания |
+| `GLOSSARY_REPETITION_COMPRESSION_THRESHOLD` | `4.0` | Порог для детекции галлюцинаций глоссария |
+
+---
+
+## Glossary System
+
+Глоссарий улучшает распознавание корпоративных терминов, имён и аббревиатур.
+
+### Режимы терминов
+
+- **soft** — термин попадает в промпт Whisper, текст не модифицируется.
+- **hard** — термин в промпте + текст нормализуется regex-заменами после распознавания.
+
+### Глобальный глоссарий (`./data/glossary/global.yml`)
 
 ```yaml
 terms:
@@ -126,14 +205,20 @@ terms:
         to: "Bauer"
 ```
 
-When creating a job, you can also provide:
+Поддерживаемые категории: `brand`, `product`, `person`, `abbreviation`, `department`.
 
-- `audio_type`: type of recording, for example `лекция`, `планерка`, `презентация`.
-- `audio_context`: short description of what is in the audio.
-- `expected_content`: expected topics, blocks and structure.
-- `dynamic_terms`: extra terms for this job only.
+### Контекст задания
 
-Dynamic terms format:
+При создании задания можно передать дополнительные поля:
+
+| Поле | Описание |
+|---|---|
+| `audio_type` | Тип записи: `лекция`, `планёрка`, `презентация` |
+| `audio_context` | Краткое описание содержимого |
+| `expected_content` | Ожидаемые темы и структура |
+| `dynamic_terms` | Термины только для этого задания (см. формат ниже) |
+
+### Динамические термины
 
 ```text
 Bauer Juicer Pro | hard | Бауэр джусер про, джусер про, соковыжималка Бауэр
@@ -141,58 +226,75 @@ Bauer Lounge Massage | hard | Бауэр лаундж массаж, лаундж
 Дмитрий Канищев | soft | Канищев, Дмитрий Канищев
 ```
 
-Glossary diagnostics are saved in `diagnostics.json` and shown on the job page: prompt, term counts, dynamic terms, hard replacement counts, repeated glossary hallucination drops and the terms used for the job.
+Формат: `Каноническая форма | режим | spoken_form1, spoken_form2, ...`
+
+### Диагностика
+
+`./data/transcripts/<job_id>/diagnostics.json` сохраняет: промпт, подобранные термины, счётчики замен, сброшенные сегменты-галлюцинации.
+
+---
 
 ## Profiles
 
-`accuracy_first` is the default for noisy lectures:
+| Параметр | `accuracy_first` | Описание |
+|---|---|---|
+| `beam_size` | 5 | Размер луча поиска |
+| `best_of` | 5 | Кандидатов на выбор |
+| `vad_filter` | false | VAD выключен — сохраняет тихую речь |
+| `condition_on_previous_text` | false | Предотвращает каскадные ошибки на длинных записях |
+| `no_speech_threshold` | 0.60 | Порог детекции тишины |
+| `temperature` | [0.0, 0.2, 0.4, 0.6] | Несколько температур для выборки |
 
-- uses `large-v3` with beam search;
-- disables VAD by default to minimize speech loss;
-- uses overlap chunking;
-- sets `condition_on_previous_text=false` to reduce long-recording cascade errors;
-- favors recall over speed.
+`accuracy_first` — профиль по умолчанию, оптимизирован для шумных русскоязычных лекций (приоритет — полнота, а не скорость).
 
-`speed_balanced` is for cleaner files:
+VAD можно переопределить глобально через `VAD_*` переменные в `.env` независимо от профиля.
 
-- lower beam settings;
-- cautious VAD enabled;
-- still uses overlap chunking.
-
-VAD can be overridden globally:
-
-```env
-VAD_FILTER=false
-VAD_THRESHOLD=0.35
-VAD_MIN_SILENCE_MS=1200
-VAD_SPEECH_PAD_MS=600
-```
+---
 
 ## Benchmark
-
-Run inside Compose:
 
 ```bash
 docker compose run --rm worker python scripts/benchmark.py /app/data/uploads/example.mp3 --profile accuracy_first
 ```
 
-Or copy a local file into `./data/uploads` first and point the script to `/app/data/uploads/<file>`. The script prints audio duration, elapsed time and real-time factor.
+Выводит: длительность аудио, время обработки и RTF (real-time factor). RTF < 1.0 означает быстрее реального времени.
 
-## Artifacts
+---
 
-For each job:
+## File Artifacts
 
-- uploaded source: `./data/uploads/<job_id>_<filename>`
-- prepared WAV: `./data/work/<job_id>/prepared_16k_mono.wav`
-- chunks: `./data/work/<job_id>/chunks`
-- exports: `./data/transcripts/<job_id>/<job_id>.txt|json|srt|vtt|docx`
-- diagnostics: `./data/transcripts/<job_id>/diagnostics.json`
-- logs: `./data/logs/app.log`
+| Путь | Содержимое |
+|---|---|
+| `./data/uploads/<job_id>_<filename>` | Исходный загруженный файл |
+| `./data/work/<job_id>/prepared_16k_mono.wav` | Подготовленный WAV (16kHz, mono) |
+| `./data/work/<job_id>/chunks/` | Нарезанные чанки |
+| `./data/transcripts/<job_id>/<job_id>.txt` | Полный текст |
+| `./data/transcripts/<job_id>/<job_id>.json` | Сегменты с временными метками и уверенностью |
+| `./data/transcripts/<job_id>/<job_id>.srt` | SubRip субтитры |
+| `./data/transcripts/<job_id>/<job_id>.vtt` | WebVTT субтитры |
+| `./data/transcripts/<job_id>/<job_id>.docx` | Word-документ с временными метками |
+| `./data/transcripts/<job_id>/diagnostics.json` | Диагностика глоссария и пайплайна |
+| `./data/logs/app.log` | Лог приложения |
 
-These files are intentionally kept so you can inspect where speech may have been lost.
+Артефакты намеренно сохраняются — они позволяют выяснить, где именно была потеряна речь.
 
-## Notes
+---
 
-- SQLite is used with WAL mode and short write transactions. This is enough for a local API plus worker setup and can be scaled later by adding more worker services carefully.
-- The app accepts any extension by default with `ALLOWED_EXTENSIONS=*`; ffmpeg is the real decoder gate. Set a comma-separated allowlist if you want stricter uploads.
-- Very large files are limited by `MAX_UPLOAD_MB`.
+## Tips
+
+**Выбор GPU** (при нескольких картах):
+```env
+CUDA_VISIBLE_DEVICES=1
+```
+
+**Снизить VRAM** (если не хватает для `float16`):
+```env
+WHISPER_COMPUTE_TYPE=int8_float16
+```
+
+**Hotwords** — включать только после тестирования на коротком фрагменте; на зашумлённых записях могут вызывать повторения терминов в начале чанков:
+```env
+GLOSSARY_ENABLE_HOTWORDS=true
+```
+
+**SQLite** работает в WAL-режиме с короткими write-транзакциями — достаточно для локального API + воркер. При необходимости масштабирования можно добавить несколько воркер-сервисов (осторожно с конкурентным доступом к GPU).

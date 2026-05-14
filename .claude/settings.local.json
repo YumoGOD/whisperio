@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Recurse -Name)",
+      "Bash(Select-Object -First 50)",
+      "Bash(Get-ChildItem -Path \"c:\\\\BauerAI\\\\whisperio2\" -Name)",
+      "Bash(findstr -i docker)",
+      "Bash(Get-ChildItem -Path \"C:\\\\BauerAI\\\\whisperio2\\\\backend\\\\app\\\\transcription\" -Recurse -File -Filter \"*.py\")",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(Sort-Object)",
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\('backend/app/main.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\('backend/app/main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(Get-ChildItem -Path \"c:\\\\BauerAI\\\\whisperio2\\\\\" -Force | Select-Object Name, FullName | Format-List)"
+    ]
+  }
+}

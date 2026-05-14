@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from inspect import signature
 from pathlib import Path
 from time import perf_counter
@@ -10,7 +11,7 @@ from typing import Any, Callable
 from faster_whisper import WhisperModel
 
 from app.config import Settings
-from app.transcription.audio import extract_chunk, prepare_audio, probe_duration_seconds
+from app.transcription.audio import extract_chunk, probe_duration_seconds
 from app.transcription.chunking import build_chunks, merge_segments, normalize_text, replace_transcript_artifacts
 from app.transcription.exports import write_exports
 from app.transcription.glossary import (
@@ -22,9 +23,6 @@ from app.transcription.glossary import (
 from app.transcription.profiles import resolve_profile
 
 logger = logging.getLogger(__name__)
-
-# Только NVIDIA CUDA (см. Dockerfile и docker-compose).
-_WHISPER_DEVICE = "cuda"
 
 ProgressCallback = Callable[[float, str], None]
 
@@ -43,16 +41,18 @@ class TranscriptionPipeline:
         if self._model is None:
             model_name = self.settings.whisper_model
             logger.info(
-                "Загрузка модели faster-whisper: model=%s device=%s compute_type=%s",
+                "Загрузка модели faster-whisper: model=%s device=%s compute_type=%s num_workers=%d",
                 model_name,
-                _WHISPER_DEVICE,
+                self.settings.whisper_device,
                 self.settings.whisper_compute_type,
+                self.settings.whisper_num_workers,
             )
             try:
                 self._model = WhisperModel(
                     model_name,
-                    device=_WHISPER_DEVICE,
+                    device=self.settings.whisper_device,
                     compute_type=self.settings.whisper_compute_type,
+                    num_workers=self.settings.whisper_num_workers,
                     download_root=str(self.settings.whisper_download_root)
                     if self.settings.whisper_download_root
                     else None,
@@ -86,17 +86,11 @@ class TranscriptionPipeline:
         job_work_dir = self.settings.work_dir / job_id
         chunk_dir = job_work_dir / "chunks"
         transcript_dir = self.settings.transcript_dir / job_id
-        prepared_path = job_work_dir / "prepared_16k_mono.wav"
 
         stage_started = perf_counter()
         self._progress(progress_callback, 0.05, "анализ длительности")
         duration_seconds = probe_duration_seconds(input_path)
         probe_elapsed = elapsed_since(stage_started)
-
-        stage_started = perf_counter()
-        self._progress(progress_callback, 0.10, "подготовка аудио")
-        prepare_audio(input_path, prepared_path, self.settings)
-        preprocess_elapsed = elapsed_since(stage_started)
 
         stage_started = perf_counter()
         chunks = build_chunks(
@@ -115,7 +109,6 @@ class TranscriptionPipeline:
             "profile_name": profile_name,
             "profile": profile,
             "job_context": {
-                "audio_type": params.get("audio_type") or "",
                 "audio_context": params.get("audio_context") or "",
                 "expected_content": params.get("expected_content") or "",
                 "dynamic_terms": params.get("dynamic_terms") or "",
@@ -125,7 +118,7 @@ class TranscriptionPipeline:
             "chunks": [],
             "settings": {
                 "model": self.settings.whisper_model,
-                "device": _WHISPER_DEVICE,
+                "device": self.settings.whisper_device,
                 "compute_type": self.settings.whisper_compute_type,
                 "language": self.settings.whisper_language or None,
                 "task": self.settings.whisper_task,
@@ -136,7 +129,6 @@ class TranscriptionPipeline:
             },
             "stage_timings": {
                 "probe_seconds": probe_elapsed,
-                "preprocess_seconds": preprocess_elapsed,
                 "chunk_plan_seconds": chunk_plan_elapsed,
                 "chunk_extract_seconds": 0.0,
                 "chunk_transcribe_seconds": 0.0,
@@ -150,7 +142,7 @@ class TranscriptionPipeline:
             self._progress(progress_callback, chunk_progress_start, f"фрагмент {chunk.index + 1}/{len(chunks)}")
             chunk_path = chunk_dir / f"chunk_{chunk.index:04d}_{int(chunk.start)}_{int(chunk.end)}.wav"
             extract_started = perf_counter()
-            extract_chunk(prepared_path, chunk_path, chunk.start, chunk.duration)
+            extract_chunk(input_path, chunk_path, chunk.start, chunk.duration, self.settings)
             extract_elapsed = elapsed_since(extract_started)
             transcribe_started = perf_counter()
             segments, info = self._transcribe_chunk(chunk_path, chunk.start, profile, glossary_context)
@@ -210,12 +202,15 @@ class TranscriptionPipeline:
             json.dumps(diagnostics, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        if chunk_dir.exists():
+            shutil.rmtree(chunk_dir)
+            logger.info("Удалены временные WAV-фрагменты: %s", chunk_dir)
         self._progress(progress_callback, 0.98, "сохранение результатов")
         return {
             "text": full_text,
             "segments": merged_segments,
             "transcript_dir": str(transcript_dir),
-            "prepared_path": str(prepared_path),
+            "prepared_path": None,
             "duration_seconds": duration_seconds,
             "exports": {key: str(path) for key, path in exports.items()},
             "diagnostics": diagnostics,
@@ -248,10 +243,7 @@ class TranscriptionPipeline:
         if glossary_context.initial_prompt:
             transcribe_kwargs["initial_prompt"] = glossary_context.initial_prompt
         if self.settings.glossary_enable_hotwords and glossary_context.hotwords and self._supports_hotwords():
-            if glossary_context.initial_prompt:
-                logger.debug("Hotwords skipped because initial_prompt already carries glossary context")
-            else:
-                transcribe_kwargs["hotwords"] = ",".join(glossary_context.hotwords)
+            transcribe_kwargs["hotwords"] = ",".join(glossary_context.hotwords)
         segments_iter, info = self.model.transcribe(str(chunk_path), **transcribe_kwargs)
         segments: list[dict[str, Any]] = []
         for segment in segments_iter:

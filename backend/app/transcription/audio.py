@@ -42,56 +42,28 @@ def probe_duration_seconds(path: Path) -> float:
         raise AudioProcessingError(f"Не удалось прочитать длительность аудио: {path}") from exc
 
 
-def prepare_audio(input_path: Path, output_path: Path, settings: Settings) -> Path:
+def extract_chunk(input_path: Path, output_path: Path, start: float, duration: float, settings: Settings) -> Path:
     if output_path.exists() and output_path.stat().st_size > 0:
-        logger.info("Используется уже подготовленный аудиофайл: %s", output_path)
         return output_path
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    filters = [f"aresample={settings.target_sample_rate}"]
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-ss",
+        f"{start:.3f}",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        str(input_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(settings.target_sample_rate),
+    ]
     if settings.enable_loudnorm:
-        filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
-
-    run_command(
-        [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-i",
-            str(input_path),
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            str(settings.target_sample_rate),
-            "-af",
-            ",".join(filters),
-            "-c:a",
-            "pcm_s16le",
-            str(output_path),
-        ]
-    )
-    return output_path
-
-
-def extract_chunk(input_path: Path, output_path: Path, start: float, duration: float) -> Path:
-    if output_path.exists() and output_path.stat().st_size > 0:
-        return output_path
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    run_command(
-        [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-ss",
-            f"{start:.3f}",
-            "-t",
-            f"{duration:.3f}",
-            "-i",
-            str(input_path),
-            "-c:a",
-            "pcm_s16le",
-            str(output_path),
-        ]
-    )
+        cmd += ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"]
+    cmd += ["-c:a", "pcm_s16le", str(output_path)]
+    run_command(cmd)
     return output_path

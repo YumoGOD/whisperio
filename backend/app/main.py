@@ -83,6 +83,22 @@ def format_ratio(value: Any) -> str:
         return "-"
 
 
+_RU_MONTHS = [
+    "", "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+
+
+def format_ru_datetime(iso_str: str | None) -> str:
+    if not iso_str:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        return f"{dt.day} {_RU_MONTHS[dt.month]} {dt.year}, {dt.hour:02}:{dt.minute:02}"
+    except (ValueError, IndexError):
+        return iso_str
+
+
 def job_elapsed_seconds(job: Job) -> float | None:
     if not job.started_at or not job.finished_at:
         return None
@@ -374,6 +390,45 @@ def page_shell(title: str, body: str, *, auto_refresh: bool = False) -> str:
           .segments {{ max-height: none; padding-right: 0; }}
           table {{ min-width: 640px; }}
         }}
+        .hidden {{ display: none !important; }}
+        @keyframes pulse-running {{
+          0%, 100% {{ opacity: 1; }}
+          50% {{ opacity: 0.55; }}
+        }}
+        .status-running {{ animation: pulse-running 1.6s ease-in-out infinite; }}
+        .file-drop-zone {{
+          border: 2px dashed var(--border);
+          border-radius: 12px;
+          transition: border-color 140ms ease, background 140ms ease;
+        }}
+        .file-drop-zone.drag-over {{
+          border-color: var(--brand);
+          background: rgba(96, 165, 250, 0.08);
+        }}
+        .file-drop-zone input[type="file"] {{ border: none; width: 100%; }}
+        .upload-progress {{
+          display: none;
+          height: 4px;
+          background: #0b1220;
+          border-radius: 999px;
+          overflow: hidden;
+          margin: 8px 0 0;
+          border: 1px solid var(--border);
+        }}
+        .upload-progress.active {{ display: block; }}
+        .upload-progress-bar {{
+          height: 100%;
+          background: linear-gradient(90deg, var(--brand), var(--ok));
+          animation: upload-indeterminate 1.4s ease-in-out infinite;
+        }}
+        @keyframes upload-indeterminate {{
+          0%   {{ transform: translateX(-100%) scaleX(0.4); }}
+          50%  {{ transform: translateX(60%) scaleX(0.5); }}
+          100% {{ transform: translateX(200%) scaleX(0.4); }}
+        }}
+        .metric-grid-4 {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
+        @media (max-width: 900px) {{ .metric-grid-4 {{ grid-template-columns: repeat(2, 1fr); }} }}
+        @media (max-width: 640px) {{ .metric-grid-4 {{ grid-template-columns: 1fr; }} }}
       </style>
     </head>
     <body>
@@ -440,11 +495,17 @@ def index() -> str:
                 <span class="muted">{progress_percent}%</span>
               </td>
               <td>{format_duration(job.duration_seconds)}</td>
-              <td><span class="muted">{job.created_at}</span></td>
+              <td><span class="muted">{format_ru_datetime(job.created_at)}</span></td>
             </tr>
             """
         )
     rows_html = "".join(rows) or '<tr><td class="empty" colspan="5">Задач пока нет. Загрузите аудиофайл, чтобы начать.</td></tr>'
+    profile_options = "\n".join(
+        f'<option value="{html.escape(key)}"'
+        f'{" selected" if key == settings.default_profile else ""}>'
+        f'{html.escape(key)}: {html.escape(val.get("description", ""))}</option>'
+        for key, val in PROFILES.items()
+    )
     body = f"""
       <div class="hero">
         <div class="brand">
@@ -457,10 +518,11 @@ def index() -> str:
         </div>
       </div>
 
-      <section class="metric-grid">
+      <section class="metric-grid metric-grid-4">
         <div class="metric"><strong>{total_jobs}</strong><span class="muted">Всего задач</span></div>
         <div class="metric"><strong>{running_jobs}</strong><span class="muted">Сейчас в работе</span></div>
         <div class="metric"><strong>{completed_jobs}</strong><span class="muted">Готово</span></div>
+        <div class="metric"><strong>{failed_jobs}</strong><span class="muted">Ошибок</span></div>
       </section>
 
       <section class="grid">
@@ -469,21 +531,21 @@ def index() -> str:
           <p class="muted">Поддерживаются форматы, которые читает ffmpeg: mp3, wav, m4a, flac, webm, mp4 и другие.</p>
           <form id="upload-form" action="/api/jobs" method="post" enctype="multipart/form-data">
             <label for="file">Файл</label>
-            <input id="file" type="file" name="file" required />
+            <div class="file-drop-zone" id="file-drop-zone">
+              <input id="file" type="file" name="file" required />
+            </div>
             <label for="profile">Профиль транскрибации</label>
             <select id="profile" name="profile">
-              <option value="accuracy_first">accuracy_first: шумные лекции, максимум полноты</option>
-              <option value="speed_balanced">speed_balanced: более чистое аудио, быстрее</option>
+              {profile_options}
             </select>
-            <label for="audio_type">Тип записи</label>
-            <input id="audio_type" name="audio_type" placeholder="Например: рекламная лекция, собрание, планерка" />
-            <label for="audio_context">Краткий контекст записи</label>
-            <textarea id="audio_context" name="audio_context" placeholder="Например: мероприятие Bauer, рекламные лекции по продуктам компании, розыгрыши призов"></textarea>
-            <label for="expected_content">Примерное наполнение</label>
-            <textarea id="expected_content" name="expected_content" placeholder="Темы, блоки, структура: соковыжималки, шерсть, массаж, призы, сертификаты"></textarea>
-            <label for="dynamic_terms">Дополнительные термины для этой задачи</label>
-            <textarea id="dynamic_terms" name="dynamic_terms" placeholder="Формат: Каноническое название | hard/soft | варианты произношения через запятую"></textarea>
+            <label for="audio_context">Описание аудио</label>
+            <textarea id="audio_context" name="audio_context" placeholder="Что за запись, кто говорит, тип мероприятия. Например: рекламная лекция Bauer, ведущий и участники"></textarea>
+            <label for="expected_content">Примерное содержание</label>
+            <textarea id="expected_content" name="expected_content" placeholder="Темы, блоки, продукты. Например: соковыжималки, массаж, призы, сертификаты"></textarea>
+            <label for="dynamic_terms">Дополнительные слова (необязательно)</label>
+            <textarea id="dynamic_terms" name="dynamic_terms" placeholder="Одно слово или фраза на строку. Опционально: Слово | вариант1, вариант2"></textarea>
             <button id="upload-button" type="submit">Загрузить и распознать</button>
+            <div class="upload-progress" id="upload-progress"><div class="upload-progress-bar"></div></div>
             <p id="upload-status" class="muted"></p>
           </form>
           <div class="timeline">
@@ -501,7 +563,6 @@ def index() -> str:
               <h2>Задачи</h2>
               <p class="muted">Откройте задачу, чтобы слушать запись, сверять сегменты и скачать результат.</p>
             </div>
-            <span class="badge status-failed">Ошибок: {failed_jobs}</span>
           </div>
           <div class="table-wrap">
             <table>
@@ -516,18 +577,38 @@ def index() -> str:
         const form = document.getElementById("upload-form");
         const button = document.getElementById("upload-button");
         const status = document.getElementById("upload-status");
+        const uploadProgress = document.getElementById("upload-progress");
         form.addEventListener("submit", async (event) => {{
           event.preventDefault();
           button.disabled = true;
           status.textContent = "Загрузка файла...";
+          uploadProgress.classList.add("active");
           try {{
             const response = await fetch(form.action, {{ method: "POST", body: new FormData(form) }});
             const payload = await response.json();
             if (!response.ok) throw new Error(payload.detail || "Не удалось загрузить файл");
             window.location.href = `/jobs/${{payload.id}}`;
           }} catch (error) {{
+            uploadProgress.classList.remove("active");
             status.textContent = error.message;
             button.disabled = false;
+          }}
+        }});
+        const dropZone = document.getElementById("file-drop-zone");
+        dropZone.addEventListener("dragover", (e) => {{
+          e.preventDefault();
+          dropZone.classList.add("drag-over");
+        }});
+        dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag-over"));
+        dropZone.addEventListener("drop", (e) => {{
+          e.preventDefault();
+          dropZone.classList.remove("drag-over");
+          const files = e.dataTransfer.files;
+          if (files.length > 0) {{
+            const fileInput = document.getElementById("file");
+            const dt = new DataTransfer();
+            dt.items.add(files[0]);
+            fileInput.files = dt.files;
           }}
         }});
       </script>
@@ -649,16 +730,14 @@ def job_page(job_id: str) -> str:
         """
     glossary = diagnostics.get("glossary") or {}
     job_context = diagnostics.get("job_context") or {
-        "audio_type": job.params.get("audio_type") or "",
         "audio_context": job.params.get("audio_context") or "",
         "expected_content": job.params.get("expected_content") or "",
         "dynamic_terms": job.params.get("dynamic_terms") or "",
     }
     glossary_html = render_kv(
         [
-            ("Тип записи", job_context.get("audio_type")),
-            ("Контекст", job_context.get("audio_context")),
-            ("Ожидаемое наполнение", job_context.get("expected_content")),
+            ("Описание аудио", job_context.get("audio_context")),
+            ("Примерное содержание", job_context.get("expected_content")),
             ("Терминов всего", glossary.get("terms_total")),
             ("Hard терминов", glossary.get("hard_terms")),
             ("Soft терминов", glossary.get("soft_terms")),
@@ -691,20 +770,19 @@ def job_page(job_id: str) -> str:
             </table>
           </details>
         """
-    auto_refresh = job.status in {"pending", "running"}
     body = f"""
-      <div class="topbar">
+      <div class="topbar" data-job-id="{job.id}" data-initial-status="{job.status}">
         <div class="brand">
           <a href="/">Назад к задачам</a>
           <h1>{html.escape(job.original_filename)}</h1>
           <span class="muted">{job.id}</span>
         </div>
-        <span class="badge {status_class(job.status)}">{status_label(job.status)}</span>
+        <span id="status-badge" class="badge {status_class(job.status)}">{status_label(job.status)}</span>
       </div>
 
       <section class="metric-grid">
-        <div class="metric"><strong>{status_label(job.status)}</strong><span class="muted">Текущий статус</span></div>
-        <div class="metric"><strong>{progress_percent}%</strong><span class="muted">Прогресс обработки</span></div>
+        <div class="metric"><strong id="metric-status">{status_label(job.status)}</strong><span class="muted">Текущий статус</span></div>
+        <div class="metric"><strong id="metric-progress">{progress_percent}%</strong><span class="muted">Прогресс обработки</span></div>
         <div class="metric"><strong>{format_duration(job.duration_seconds)}</strong><span class="muted">Длительность аудио</span></div>
       </section>
 
@@ -725,13 +803,13 @@ def job_page(job_id: str) -> str:
           <p class="muted">Нажмите на сегмент текста, чтобы перейти к этому месту в аудио. Активный сегмент подсвечивается во время проигрывания.</p>
 
           <h3>Статус задачи</h3>
-          <div class="progress" title="{progress_percent}%"><span style="width: {progress_percent}%"></span></div>
+          <div class="progress" id="progress-bar" title="{progress_percent}%"><span id="progress-bar-inner" style="width: {progress_percent}%"></span></div>
           <div class="status-line">
-            <p>Выполнено: {progress_percent}%</p>
+            <p id="progress-text">Выполнено: {progress_percent}%</p>
             <span class="pill">{format_duration(job.duration_seconds)}</span>
           </div>
           <p><strong>Профиль:</strong> {html.escape(str(job.params.get("profile", "-")))}</p>
-          <p><strong>Создана:</strong> <span class="muted">{job.created_at}</span></p>
+          <p><strong>Создана:</strong> <span class="muted">{format_ru_datetime(job.created_at)}</span></p>
           {error_html}
 
           <h3>Метрики выполнения</h3>
@@ -763,7 +841,7 @@ def job_page(job_id: str) -> str:
               <h2>Текст с таймингами</h2>
               <p class="muted">Проверяйте распознавание по аудио, ищите фразы и переходите между сегментами.</p>
             </div>
-            <span class="pill">{len(segments)} сегм.</span>
+            <span class="pill" id="segment-count">{len(segments)} сегм.</span>
           </div>
           <div class="toolbar">
             <input id="segment-search" class="search" type="search" placeholder="Поиск по транскрипту..." />
@@ -827,9 +905,14 @@ def job_page(job_id: str) -> str:
 
         copyText.addEventListener("click", async () => {{
           const text = segments.map((segment) => segment.text).join("\\n");
-          await navigator.clipboard.writeText(text);
-          copyText.textContent = "Скопировано";
-          setTimeout(() => copyText.textContent = "Скопировать текст", 1400);
+          try {{
+            await navigator.clipboard.writeText(text);
+            copyText.textContent = "Скопировано";
+            setTimeout(() => {{ copyText.textContent = "Скопировать текст"; }}, 1400);
+          }} catch (err) {{
+            copyText.textContent = "Ошибка: нет доступа к буферу";
+            setTimeout(() => {{ copyText.textContent = "Скопировать текст"; }}, 2500);
+          }}
         }});
 
         toggleAutoscroll.addEventListener("click", () => {{
@@ -845,14 +928,93 @@ def job_page(job_id: str) -> str:
 
         search.addEventListener("input", () => {{
           const query = search.value.trim().toLowerCase();
+          let visible = 0;
           buttons.forEach((button) => {{
             const text = button.textContent.toLowerCase();
-            button.style.display = text.includes(query) ? "grid" : "none";
+            const show = text.includes(query);
+            button.classList.toggle("hidden", !show);
+            if (show) visible++;
           }});
+          const counter = document.getElementById("segment-count");
+          if (counter) {{
+            counter.textContent = query
+              ? `${{visible}} из ${{buttons.length}} сегм.`
+              : `${{buttons.length}} сегм.`;
+          }}
         }});
+
+        document.addEventListener("keydown", (e) => {{
+          const tag = document.activeElement && document.activeElement.tagName;
+          if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+          if (e.key === " " || e.code === "Space") {{
+            e.preventDefault();
+            if (audio.paused) audio.play();
+            else audio.pause();
+          }} else if (e.key === "ArrowLeft") {{
+            e.preventDefault();
+            audio.currentTime = Math.max(0, audio.currentTime - 10);
+          }} else if (e.key === "ArrowRight") {{
+            e.preventDefault();
+            audio.currentTime = Math.min(audio.duration || audio.currentTime + 10, audio.currentTime + 10);
+          }}
+        }});
+
+        (function () {{
+          const topbar = document.querySelector(".topbar[data-job-id]");
+          if (!topbar) return;
+          const jobId = topbar.dataset.jobId;
+          const initialStatus = topbar.dataset.initialStatus;
+          if (initialStatus !== "pending" && initialStatus !== "running") return;
+
+          const statusBadge = document.getElementById("status-badge");
+          const metricStatus = document.getElementById("metric-status");
+          const metricProgress = document.getElementById("metric-progress");
+          const progressBar = document.getElementById("progress-bar");
+          const progressBarInner = document.getElementById("progress-bar-inner");
+          const progressText = document.getElementById("progress-text");
+
+          const STATUS_CLASS = {{
+            pending: "status-pending",
+            running: "status-running",
+            completed: "status-completed",
+            failed: "status-failed",
+          }};
+          const STATUS_LABEL = {{
+            pending: "В очереди",
+            running: "Обрабатывается",
+            completed: "Готово",
+            failed: "Ошибка",
+          }};
+
+          function applyStatus(data) {{
+            const cls = STATUS_CLASS[data.status] || "status-pending";
+            const label = STATUS_LABEL[data.status] || data.status;
+            const pct = Math.round((data.progress || 0) * 100);
+            statusBadge.className = `badge ${{cls}}`;
+            statusBadge.textContent = label;
+            metricStatus.textContent = label;
+            metricProgress.textContent = `${{pct}}%`;
+            progressBarInner.style.width = `${{pct}}%`;
+            progressBar.title = `${{pct}}%`;
+            progressText.textContent = `Выполнено: ${{pct}}%`;
+          }}
+
+          const interval = setInterval(async () => {{
+            try {{
+              const resp = await fetch(`/api/jobs/${{jobId}}`);
+              if (!resp.ok) return;
+              const data = await resp.json();
+              applyStatus(data);
+              if (data.status !== "pending" && data.status !== "running") {{
+                clearInterval(interval);
+                if (data.status === "completed") window.location.reload();
+              }}
+            }} catch (_) {{}}
+          }}, 5000);
+        }})();
       </script>
     """
-    return page_shell(f"Задача {job.id}", body, auto_refresh=auto_refresh)
+    return page_shell(f"Задача {job.id}", body)
 
 
 @app.get("/api/health")
@@ -869,7 +1031,6 @@ def profiles() -> dict[str, Any]:
 def create_job(
     file: UploadFile = File(...),
     profile: str = Form(default=settings.default_profile),
-    audio_type: str = Form(default=""),
     audio_context: str = Form(default=""),
     expected_content: str = Form(default=""),
     dynamic_terms: str = Form(default=""),
@@ -910,7 +1071,6 @@ def create_job(
         "compute_type": settings.whisper_compute_type,
         "language": settings.whisper_language,
         "task": settings.whisper_task,
-        "audio_type": audio_type.strip(),
         "audio_context": audio_context.strip(),
         "expected_content": expected_content.strip(),
         "dynamic_terms": dynamic_terms.strip(),
