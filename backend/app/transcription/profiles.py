@@ -20,7 +20,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "temperature": [0.0, 0.2, 0.4, 0.6],
         "compression_ratio_threshold": 2.4,
         "log_prob_threshold": -1.0,
-        "no_speech_threshold": 0.60,
+        "no_speech_threshold": 0.85,
         "condition_on_previous_text": False,
         "word_timestamps": False,
         "vad_filter": True,
