@@ -24,6 +24,7 @@ class GlossaryTerm:
     description: str = ""
     replacements: list[dict[str, str]] = field(default_factory=list)
     source: Literal["global", "dynamic"] = "global"
+    min_words: int = 0
 
 
 @dataclass(slots=True)
@@ -100,20 +101,27 @@ def parse_term(payload: dict[str, Any], source: Literal["global", "dynamic"]) ->
     mode = str(payload.get("mode") or "soft").strip().lower()
     if mode not in {"hard", "soft"}:
         raise ValueError(f"Некорректный mode для термина {canonical!r}: {mode!r}")
-    spoken_forms = payload.get("spoken_forms") or []
+    # "forms" is a short alias for "spoken_forms"; "note" is a short alias for "description"
+    spoken_forms = payload.get("forms") or payload.get("spoken_forms") or []
+    description = str(payload.get("note") or payload.get("description") or "").strip()
     replacements = payload.get("replacements") or []
+    try:
+        min_words = int(payload.get("min_words") or 0)
+    except (TypeError, ValueError):
+        min_words = 0
     return GlossaryTerm(
         canonical=canonical,
         mode=mode,  # type: ignore[arg-type]
         category=str(payload.get("category") or "term").strip() or "term",
         spoken_forms=[str(item).strip() for item in spoken_forms if str(item).strip()],
-        description=str(payload.get("description") or "").strip(),
+        description=description,
         replacements=[
             {"from": str(item.get("from") or ""), "to": str(item.get("to") or canonical)}
             for item in replacements
             if isinstance(item, dict) and str(item.get("from") or "").strip()
         ],
         source=source,
+        min_words=max(0, min_words),
     )
 
 
@@ -227,12 +235,21 @@ def build_hotwords(settings: Settings, terms: list[GlossaryTerm]) -> list[str]:
     return deduped
 
 
-def apply_hard_normalization(text: str, context: GlossaryContext, enabled: bool = True) -> str:
+def apply_hard_normalization(
+    text: str,
+    context: GlossaryContext,
+    enabled: bool = True,
+    min_segment_words: int = 0,
+) -> str:
     if not enabled or not text:
         return text
+    segment_words = len(text.split())
     normalized = text
     for term in context.terms:
         if term.mode != "hard":
+            continue
+        effective_min = max(term.min_words, min_segment_words)
+        if effective_min > 0 and segment_words < effective_min:
             continue
         replacements = term.replacements or generated_replacements(term)
         for replacement in replacements:

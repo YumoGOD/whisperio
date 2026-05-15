@@ -290,6 +290,7 @@ class TranscriptionPipeline:
                 text,
                 glossary_context,
                 enabled=self.settings.glossary_enable_hard_normalization,
+                min_segment_words=self.settings.glossary_hard_min_segment_words,
             )
             segments.append(
                 {
