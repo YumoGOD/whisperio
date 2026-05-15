@@ -62,6 +62,11 @@ def extract_chunk(input_path: Path, output_path: Path, start: float, duration: f
         "ffmpeg",
         "-y",
         "-hide_banner",
+        # Ignore MP4/MOV edit lists: some recorders write an ELST box that delays
+        # the audio track by N seconds, causing ffmpeg to pad output with silence.
+        # For non-MP4 files this flag is silently ignored.
+        "-ignore_editlist",
+        "1",
         "-ss",
         f"{start:.3f}",
         "-t",

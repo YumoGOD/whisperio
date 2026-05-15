@@ -214,6 +214,28 @@ class TranscriptionPipeline:
                             profile_attempt["beam_size"] = 1
                             profile_attempt["best_of"] = 1
                             profile_attempt["temperature"] = [0.0]
+
+                # Если первый чанк не дал сегментов в первых 30с при наличии initial_prompt —
+                # повтор без промпта: промпт может сбивать декодер Whisper на первом окне.
+                if chunk.index == 0 and (glossary_context.initial_prompt or prev_tail_text):
+                    has_early = any(s["start"] < chunk.start + 30.0 for s in segments)
+                    if not has_early:
+                        logger.warning(
+                            "Первый чанк: нет сегментов до %.0fс — повтор без initial_prompt "
+                            "(промпт может мешать Whisper на первом 30-сек окне)",
+                            chunk.start + 30.0,
+                        )
+                        segments_retry, _ = self._transcribe_chunk(
+                            chunk_path, chunk.start, profile_attempt, glossary_context,
+                            prev_tail_text=None, use_initial_prompt=False,
+                        )
+                        if segments_retry:
+                            segments = segments_retry
+                            logger.info(
+                                "Повтор без промпта успешен: %d сегментов, первый в %.1fс",
+                                len(segments_retry), segments_retry[0]["start"],
+                            )
+
                 prev_tail_text = _build_context_tail(segments)
                 transcribe_elapsed = elapsed_since(transcribe_started)
                 diagnostics["stage_timings"]["chunk_extract_seconds"] = round(
@@ -296,6 +318,7 @@ class TranscriptionPipeline:
         profile: dict[str, Any],
         glossary_context: GlossaryContext,
         prev_tail_text: str | None = None,
+        use_initial_prompt: bool = True,
     ):
         vad_filter = bool(profile.get("vad_filter", False))
         vad_parameters = profile.get("vad_parameters") if vad_filter else None
@@ -314,7 +337,7 @@ class TranscriptionPipeline:
             "vad_filter": vad_filter,
             "vad_parameters": vad_parameters,
         }
-        if prev_tail_text or glossary_context.initial_prompt:
+        if use_initial_prompt and (prev_tail_text or glossary_context.initial_prompt):
             transcribe_kwargs["initial_prompt"] = _merge_prompts(
                 prev_tail_text,
                 glossary_context.initial_prompt,
@@ -322,11 +345,41 @@ class TranscriptionPipeline:
             )
         if self.settings.glossary_enable_hotwords and glossary_context.hotwords and self._supports_hotwords():
             transcribe_kwargs["hotwords"] = ",".join(glossary_context.hotwords)
+
+        logger.debug(
+            "Транскрибация чанка offset=%.0fс: no_speech_thr=%.2f log_prob_thr=%.2f vad=%s prompt=%s",
+            offset_seconds,
+            float(profile["no_speech_threshold"]),
+            float(profile["log_prob_threshold"]),
+            vad_filter,
+            repr(transcribe_kwargs["initial_prompt"][:60]) if "initial_prompt" in transcribe_kwargs else "нет",
+        )
+
         segments_iter, info = self.model.transcribe(str(chunk_path), **transcribe_kwargs)
         segments: list[dict[str, Any]] = []
+        raw_count = 0
+        first_raw_start: float | None = None
+
         for segment in segments_iter:
+            raw_count += 1
+            seg_start = float(segment.start) + offset_seconds
+            seg_end = float(segment.end) + offset_seconds
+            if first_raw_start is None:
+                first_raw_start = seg_start
             text = normalize_text(segment.text)
             compression_ratio = getattr(segment, "compression_ratio", None)
+            avg_logprob = getattr(segment, "avg_logprob", None)
+            no_speech_prob = getattr(segment, "no_speech_prob", None)
+
+            logger.debug(
+                "  Сырой сег %.2f–%.2fс: no_speech=%.3f logprob=%.3f cr=%s text=%r",
+                seg_start, seg_end,
+                no_speech_prob or 0.0,
+                avg_logprob or 0.0,
+                f"{compression_ratio:.2f}" if compression_ratio is not None else "N/A",
+                text[:80],
+            )
+
             if should_drop_glossary_repetition(
                 text,
                 glossary_context,
@@ -335,10 +388,7 @@ class TranscriptionPipeline:
             ):
                 logger.warning(
                     "Сегмент пропущен как вероятная словарная галлюцинация: start=%.2f end=%.2f compression_ratio=%s text=%r",
-                    float(segment.start) + offset_seconds,
-                    float(segment.end) + offset_seconds,
-                    compression_ratio,
-                    text[:220],
+                    seg_start, seg_end, compression_ratio, text[:220],
                 )
                 continue
             if should_drop_general_repetition(
@@ -348,18 +398,13 @@ class TranscriptionPipeline:
             ):
                 logger.warning(
                     "Сегмент пропущен как петля-галлюцинация: start=%.2f end=%.2f compression_ratio=%s text=%r",
-                    float(segment.start) + offset_seconds,
-                    float(segment.end) + offset_seconds,
-                    compression_ratio,
-                    text[:220],
+                    seg_start, seg_end, compression_ratio, text[:220],
                 )
                 continue
             if looks_like_prompt_echo(text, glossary_context.initial_prompt):
                 logger.warning(
                     "Сегмент пропущен как эхо промпта: start=%.2f end=%.2f text=%r",
-                    float(segment.start) + offset_seconds,
-                    float(segment.end) + offset_seconds,
-                    text[:220],
+                    seg_start, seg_end, text[:220],
                 )
                 continue
             text = apply_hard_normalization(
@@ -371,14 +416,39 @@ class TranscriptionPipeline:
             segments.append(
                 {
                     "id": len(segments),
-                    "start": float(segment.start) + offset_seconds,
-                    "end": float(segment.end) + offset_seconds,
+                    "start": seg_start,
+                    "end": seg_end,
                     "text": text,
-                    "avg_logprob": getattr(segment, "avg_logprob", None),
-                    "no_speech_prob": getattr(segment, "no_speech_prob", None),
+                    "avg_logprob": avg_logprob,
+                    "no_speech_prob": no_speech_prob,
                     "compression_ratio": compression_ratio,
                 }
             )
+
+        if raw_count == 0:
+            logger.warning(
+                "Чанк offset=%.0fс: faster-whisper не выдал НИ ОДНОГО сегмента. "
+                "no_speech_threshold=%.2f log_prob_threshold=%.2f vad=%s prompt=%s",
+                offset_seconds,
+                float(profile["no_speech_threshold"]),
+                float(profile["log_prob_threshold"]),
+                vad_filter,
+                "да" if "initial_prompt" in transcribe_kwargs else "нет",
+            )
+        elif first_raw_start is not None and first_raw_start >= offset_seconds + 29.0:
+            logger.warning(
+                "Чанк offset=%.0fс: Whisper пропустил первое 30-сек окно — "
+                "первый сегмент начинается в %.1fс (ожидается ~%.1fс). "
+                "no_speech_prob и avg_logprob выше смотрите в DEBUG-логах.",
+                offset_seconds, first_raw_start, offset_seconds,
+            )
+        else:
+            logger.info(
+                "Чанк offset=%.0fс: %d сырых сег → %d после фильтров%s",
+                offset_seconds, raw_count, len(segments),
+                f" | первый в {first_raw_start:.1f}с" if first_raw_start is not None else "",
+            )
+
         return segments, info
 
     def _supports_hotwords(self) -> bool:
