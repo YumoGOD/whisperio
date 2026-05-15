@@ -8,6 +8,8 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
 
+import torch
+
 from faster_whisper import WhisperModel
 
 from app.config import Settings
@@ -31,6 +33,34 @@ ProgressCallback = Callable[[float, str], None]
 
 def elapsed_since(started_at: float) -> float:
     return round(perf_counter() - started_at, 3)
+
+
+def _build_context_tail(segments: list[dict[str, Any]], max_chars: int = 400) -> str | None:
+    """Return the trailing text of processed segments to use as inter-chunk context."""
+    if not segments:
+        return None
+    parts: list[str] = []
+    total = 0
+    for seg in reversed(segments[-10:]):
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        if total + len(text) + 1 > max_chars:
+            break
+        parts.insert(0, text)
+        total += len(text) + 1
+    return " ".join(parts) if parts else None
+
+
+def _merge_prompts(tail: str | None, glossary_prompt: str, max_chars: int = 1400) -> str:
+    """Combine prev-chunk tail (priority) and glossary prompt within max_chars."""
+    if not tail:
+        return glossary_prompt[:max_chars]
+    tail = tail[:max_chars]
+    remaining = max_chars - len(tail) - 1
+    if glossary_prompt and remaining > 20:
+        return f"{tail} {glossary_prompt[:remaining]}"
+    return tail
 
 
 class TranscriptionPipeline:
@@ -139,6 +169,7 @@ class TranscriptionPipeline:
             },
         }
 
+        prev_tail_text: str | None = None
         for chunk in chunks:
             chunk_progress_start = 0.15 + 0.75 * (chunk.index / len(chunks))
             self._progress(progress_callback, chunk_progress_start, f"фрагмент {chunk.index + 1}/{len(chunks)}")
@@ -147,7 +178,28 @@ class TranscriptionPipeline:
             extract_chunk(input_path, chunk_path, chunk.start, chunk.duration, self.settings)
             extract_elapsed = elapsed_since(extract_started)
             transcribe_started = perf_counter()
-            segments, info = self._transcribe_chunk(chunk_path, chunk.start, profile, glossary_context)
+            profile_attempt = dict(profile)
+            for attempt in range(3):
+                try:
+                    segments, info = self._transcribe_chunk(
+                        chunk_path, chunk.start, profile_attempt, glossary_context, prev_tail_text
+                    )
+                    break
+                except Exception as exc:
+                    logger.warning(
+                        "Чанк %s: попытка %d/3 не удалась: %s", chunk_path.name, attempt + 1, exc
+                    )
+                    if attempt == 2:
+                        raise
+                    torch.cuda.empty_cache()
+                    if attempt == 0:
+                        profile_attempt["beam_size"] = max(1, profile["beam_size"] - 2)
+                        profile_attempt["best_of"] = max(1, profile["best_of"] - 2)
+                    else:
+                        profile_attempt["beam_size"] = 1
+                        profile_attempt["best_of"] = 1
+                        profile_attempt["temperature"] = [0.0]
+            prev_tail_text = _build_context_tail(segments)
             transcribe_elapsed = elapsed_since(transcribe_started)
             diagnostics["stage_timings"]["chunk_extract_seconds"] = round(
                 diagnostics["stage_timings"]["chunk_extract_seconds"] + extract_elapsed,
@@ -178,7 +230,7 @@ class TranscriptionPipeline:
         self._progress(progress_callback, 0.92, "постобработка")
         merged_segments = merge_segments(all_segments, int(params.get("chunk_overlap_seconds") or self.settings.chunk_overlap_seconds))
         merged_segments, artifact_stats = replace_transcript_artifacts(merged_segments)
-        full_text = normalize_text(" ".join(segment["text"] for segment in merged_segments))
+        full_text = " ".join(segment["text"] for segment in merged_segments)
         diagnostics["stage_timings"]["postprocess_seconds"] = elapsed_since(stage_started)
         diagnostics["merged_segments"] = len(merged_segments)
         diagnostics["artifact_postprocessing"] = artifact_stats
@@ -224,6 +276,7 @@ class TranscriptionPipeline:
         offset_seconds: float,
         profile: dict[str, Any],
         glossary_context: GlossaryContext,
+        prev_tail_text: str | None = None,
     ):
         vad_filter = bool(profile.get("vad_filter", False))
         vad_parameters = profile.get("vad_parameters") if vad_filter else None
@@ -242,8 +295,12 @@ class TranscriptionPipeline:
             "vad_filter": vad_filter,
             "vad_parameters": vad_parameters,
         }
-        if glossary_context.initial_prompt:
-            transcribe_kwargs["initial_prompt"] = glossary_context.initial_prompt
+        if prev_tail_text or glossary_context.initial_prompt:
+            transcribe_kwargs["initial_prompt"] = _merge_prompts(
+                prev_tail_text,
+                glossary_context.initial_prompt,
+                self.settings.glossary_prompt_max_chars,
+            )
         if self.settings.glossary_enable_hotwords and glossary_context.hotwords and self._supports_hotwords():
             transcribe_kwargs["hotwords"] = ",".join(glossary_context.hotwords)
         segments_iter, info = self.model.transcribe(str(chunk_path), **transcribe_kwargs)

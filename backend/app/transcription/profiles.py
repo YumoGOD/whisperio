@@ -16,6 +16,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "description": "Noisy lecture profile. Prefer recall and boundary safety over speed.",
         "beam_size": 5,
         "best_of": 5,
+<<<<<<< HEAD
         "patience": 1.0,
         "temperature": [0.0, 0.2, 0.4, 0.6],
         "compression_ratio_threshold": 2.4,
@@ -23,6 +24,34 @@ PROFILES: dict[str, dict[str, Any]] = {
         "no_speech_threshold": 0.85,
         "condition_on_previous_text": False,
         "word_timestamps": False,
+=======
+        "patience": 1.2,
+        "temperature": [0.0, 0.2, 0.4],
+        "compression_ratio_threshold": 2.4,
+        "log_prob_threshold": -1.2,
+        "no_speech_threshold": 0.60,
+        "condition_on_previous_text": True,
+        "word_timestamps": True,
+        "vad_filter": True,
+        # threshold=0.20 catches quiet/muffled speech; wide pads prevent mid-word cuts.
+        "vad_parameters": {
+            "threshold": 0.20,
+            "min_silence_duration_ms": 1500,
+            "speech_pad_ms": 800,
+        },
+    },
+    "speed_balanced": {
+        "description": "Cleaner audio profile. Faster decoding with cautious VAD enabled.",
+        "beam_size": 3,
+        "best_of": 3,
+        "patience": 1.0,
+        "temperature": [0.0, 0.2],
+        "compression_ratio_threshold": 2.4,
+        "log_prob_threshold": -1.0,
+        "no_speech_threshold": 0.75,
+        "condition_on_previous_text": True,
+        "word_timestamps": True,
+>>>>>>> claude/dreamy-mahavira-7fbc0f
         "vad_filter": True,
         "vad_parameters": {
             "threshold": 0.3,

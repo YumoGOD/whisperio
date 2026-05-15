@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     worker_id: str | None = None
 
     chunk_seconds: int = 1800
-    chunk_overlap_seconds: int = 15
+    chunk_overlap_seconds: int = 45
     enable_loudnorm: bool = True
     target_sample_rate: int = 16000
 

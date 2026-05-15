@@ -10,7 +10,9 @@
       "Bash(Sort-Object)",
       "Bash(python -c \"import ast, sys; ast.parse\\(open\\('backend/app/main.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
       "Bash(python -c \"import ast, sys; ast.parse\\(open\\('backend/app/main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
-      "Bash(Get-ChildItem -Path \"c:\\\\BauerAI\\\\whisperio2\\\\\" -Force | Select-Object Name, FullName | Format-List)"
+      "Bash(Get-ChildItem -Path \"c:\\\\BauerAI\\\\whisperio2\\\\\" -Force | Select-Object Name, FullName | Format-List)",
+      "Bash(python c:/BauerAI/whisperio2/data/transcripts/f0d08271cd8b4ed9ae7cdaae37f54a9f/diagnostics.json)",
+      "Bash(python -c ' *)"
     ]
   }
 }

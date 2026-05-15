@@ -63,7 +63,49 @@ def extract_chunk(input_path: Path, output_path: Path, start: float, duration: f
         str(settings.target_sample_rate),
     ]
     if settings.enable_loudnorm:
-        cmd += ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"]
-    cmd += ["-c:a", "pcm_s16le", str(output_path)]
-    run_command(cmd)
+        # Single-pass voice filter: removes sub-200 Hz rumble, >8 kHz noise, boosts quiet audio.
+        filters.append("highpass=f=200,lowpass=f=8000,volume=1.5")
+
+    run_command(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-i",
+            str(input_path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            str(settings.target_sample_rate),
+            "-af",
+            ",".join(filters),
+            "-c:a",
+            "pcm_s16le",
+            str(output_path),
+        ]
+    )
+    return output_path
+
+
+def extract_chunk(input_path: Path, output_path: Path, start: float, duration: float) -> Path:
+    if output_path.exists() and output_path.stat().st_size > 0:
+        return output_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    run_command(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-ss",
+            f"{start:.3f}",
+            "-t",
+            f"{duration:.3f}",
+            "-i",
+            str(input_path),
+            "-c:a",
+            "pcm_s16le",
+            str(output_path),
+        ]
+    )
     return output_path
