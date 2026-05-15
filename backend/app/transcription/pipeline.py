@@ -8,8 +8,6 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
 
-import torch
-
 from faster_whisper import WhisperModel
 
 from app.config import Settings
@@ -191,7 +189,11 @@ class TranscriptionPipeline:
                     )
                     if attempt == 2:
                         raise
-                    torch.cuda.empty_cache()
+                    try:
+                        import torch
+                        torch.cuda.empty_cache()
+                    except ImportError:
+                        pass
                     if attempt == 0:
                         profile_attempt["beam_size"] = max(1, profile["beam_size"] - 2)
                         profile_attempt["best_of"] = max(1, profile["best_of"] - 2)
