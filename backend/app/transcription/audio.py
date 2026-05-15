@@ -46,6 +46,7 @@ def extract_chunk(input_path: Path, output_path: Path, start: float, duration: f
     if output_path.exists() and output_path.stat().st_size > 0:
         return output_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
+<<<<<<< HEAD
     cmd = [
         "ffmpeg",
         "-y",
@@ -62,29 +63,30 @@ def extract_chunk(input_path: Path, output_path: Path, start: float, duration: f
         "-ar",
         str(settings.target_sample_rate),
     ]
+=======
+    filters = []
+>>>>>>> claude/zealous-kare-20eb80
     if settings.enable_loudnorm:
         # Single-pass voice filter: removes sub-200 Hz rumble, >8 kHz noise, boosts quiet audio.
         filters.append("highpass=f=200,lowpass=f=8000,volume=1.5")
 
-    run_command(
-        [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-i",
-            str(input_path),
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            str(settings.target_sample_rate),
-            "-af",
-            ",".join(filters),
-            "-c:a",
-            "pcm_s16le",
-            str(output_path),
-        ]
-    )
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-i",
+        str(input_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(settings.target_sample_rate),
+    ]
+    if filters:
+        cmd += ["-af", ",".join(filters)]
+    cmd += ["-c:a", "pcm_s16le", str(output_path)]
+
+    run_command(cmd)
     return output_path
 
 
@@ -104,7 +106,7 @@ def extract_chunk(input_path: Path, output_path: Path, start: float, duration: f
             "-i",
             str(input_path),
             "-c:a",
-            "pcm_s16le",
+            "copy",
             str(output_path),
         ]
     )
