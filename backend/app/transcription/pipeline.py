@@ -12,7 +12,7 @@ from faster_whisper import WhisperModel
 
 from app.config import Settings
 from app.transcription.audio import extract_chunk, probe_duration_seconds
-from app.transcription.chunking import build_chunks, merge_segments, normalize_text, replace_transcript_artifacts
+from app.transcription.chunking import build_chunks, group_segments_by_sentence, merge_segments, normalize_text, replace_transcript_artifacts
 from app.transcription.exports import write_exports
 from app.transcription.glossary import (
     GlossaryContext,
@@ -267,6 +267,7 @@ class TranscriptionPipeline:
             self._progress(progress_callback, 0.92, "постобработка")
             merged_segments = merge_segments(all_segments, overlap_seconds)
             merged_segments, artifact_stats = replace_transcript_artifacts(merged_segments)
+            merged_segments = group_segments_by_sentence(merged_segments)
             full_text = " ".join(segment["text"] for segment in merged_segments)
             diagnostics["stage_timings"]["postprocess_seconds"] = elapsed_since(stage_started)
             diagnostics["merged_segments"] = len(merged_segments)

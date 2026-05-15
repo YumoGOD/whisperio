@@ -91,6 +91,71 @@ def replace_transcript_artifacts(segments: list[dict]) -> tuple[list[dict], dict
     return processed, stats
 
 
+GAP_THRESHOLD_SECONDS = 2.0
+
+
+def _sentence_ends(text: str) -> bool:
+    stripped = text.rstrip()
+    return bool(stripped) and stripped[-1] in ".!?…"
+
+
+def _merge_group(group: list[dict]) -> dict:
+    texts = [normalize_text(s["text"]) for s in group]
+    logprobs = [s["avg_logprob"] for s in group if s.get("avg_logprob") is not None]
+    return {
+        "id": group[0]["id"],
+        "start": group[0]["start"],
+        "end": group[-1]["end"],
+        "text": " ".join(texts),
+        "avg_logprob": round(sum(logprobs) / len(logprobs), 4) if logprobs else None,
+        "no_speech_prob": None,
+        "compression_ratio": None,
+    }
+
+
+def group_segments_by_sentence(
+    segments: list[dict],
+    gap_threshold_seconds: float = GAP_THRESHOLD_SECONDS,
+) -> list[dict]:
+    """Groups consecutive segments into sentence-level blocks.
+    Inserts UNINTELLIGIBLE_TEXT marker for silent gaps between blocks."""
+    if not segments:
+        return []
+
+    result: list[dict] = []
+    current_group: list[dict] = []
+
+    for segment in segments:
+        text = normalize_text(segment.get("text", ""))
+        if not text:
+            continue
+
+        if current_group:
+            gap = segment["start"] - current_group[-1]["end"]
+            if gap > gap_threshold_seconds:
+                result.append(_merge_group(current_group))
+                result.append({
+                    "id": -1,
+                    "start": current_group[-1]["end"],
+                    "end": segment["start"],
+                    "text": UNINTELLIGIBLE_TEXT,
+                    "avg_logprob": None,
+                    "no_speech_prob": None,
+                    "compression_ratio": None,
+                })
+                current_group = []
+            elif _sentence_ends(current_group[-1]["text"]):
+                result.append(_merge_group(current_group))
+                current_group = []
+
+        current_group.append({**segment, "text": text})
+
+    if current_group:
+        result.append(_merge_group(current_group))
+
+    return result
+
+
 def merge_segments(segments: list[dict], overlap_seconds: int) -> list[dict]:
     merged: list[dict] = []
     for segment in sorted(segments, key=lambda item: (item["start"], item["end"])):
