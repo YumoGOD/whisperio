@@ -10,15 +10,16 @@ PROFILES: dict[str, dict[str, Any]] = {
     "accuracy_first": {
         # Тихое/зашумлённое аудио низкого качества. Приоритет — полнота транскрипта.
         #
-        # no_speech_threshold=0.90: Whisper пропускает 30-сек окно только если уверен на 90%,
-        #   что там тишина — иначе тихая речь с no_speech_prob~0.87 терялась бы.
-        # log_prob_threshold=-2.0: принимаем сегменты с низкой уверенностью (деградированный
-        #   сигнал даёт плохие log prob); VAD уже отфильтровал чистую тишину.
+        # no_speech_threshold=0.95: Whisper пропускает окно только при 95%+ уверенности в тишине.
+        #   При 0.90 чёткая речь с фоновым шумом могла получить no_speech_prob ~0.91 и теряться.
+        # log_prob_threshold=-3.0: faster-whisper может отбрасывать сегмент по log_prob
+        #   независимо от no_speech (OR-логика). -3.0 принимает все сегменты с реальной речью —
+        #   VAD (threshold=0.2) уже отфильтровал чистую тишину до Whisper.
         # temperature=[0.0..0.8]: 5 ступеней фоллбека — Whisper пробует более высокую
         #   температуру когда compression_ratio слишком высокий (петля/шум).
         # condition_on_previous_text=False: каждое 30-сек окно независимо — плохое окно
         #   не отравляет контекст для следующих.
-        # VAD threshold=0.2: Silero считает речью всё с вероятностью ≥20% (вместо 30%),
+        # VAD threshold=0.2: Silero считает речью всё с вероятностью ≥20%,
         #   speech_pad_ms=1000 захватывает 1 с вокруг каждого сегмента.
         "description": "Quiet/low-quality audio profile. Maximum recall, safe segment boundaries.",
         "batch_size": 16,
@@ -27,8 +28,8 @@ PROFILES: dict[str, dict[str, Any]] = {
         "patience": 1.0,
         "temperature": [0.0, 0.2, 0.4, 0.6, 0.8],
         "compression_ratio_threshold": 2.4,
-        "log_prob_threshold": -2.0,
-        "no_speech_threshold": 0.90,
+        "log_prob_threshold": -3.0,
+        "no_speech_threshold": 0.95,
         "condition_on_previous_text": False,
         "word_timestamps": False,
         "vad_filter": True,
