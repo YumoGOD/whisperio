@@ -657,14 +657,14 @@ def job_page(job_id: str) -> str:
     runtime_settings = diagnostics.get("settings") or {}
     total_elapsed = diagnostics.get("elapsed_seconds")
     total_rtf = diagnostics.get("real_time_factor")
-    chunks_count = len(diagnostics.get("chunks") or [])
+    segments_raw = (diagnostics.get("transcribe") or {}).get("segments_raw")
     if total_elapsed is None:
         total_elapsed = job_elapsed_seconds(job)
     metrics_html = f"""
       <div class="metric-grid">
         <div class="metric"><strong>{format_seconds(total_elapsed)}</strong><span class="muted">Общее время</span></div>
         <div class="metric"><strong>{format_ratio(total_rtf)}</strong><span class="muted">Real-time factor</span></div>
-        <div class="metric"><strong>{chunks_count or '-'}</strong><span class="muted">Фрагментов</span></div>
+        <div class="metric"><strong>{segments_raw if segments_raw is not None else '-'}</strong><span class="muted">Сырых сегментов</span></div>
       </div>
     """
     whisper_html = render_kv(
@@ -679,18 +679,15 @@ def job_page(job_id: str) -> str:
             ("Best of", profile_settings.get("best_of")),
             ("VAD", "включен" if profile_settings.get("vad_filter") else "выключен"),
             ("condition_on_previous_text", profile_settings.get("condition_on_previous_text")),
-            ("Chunk", f"{runtime_settings.get('chunk_seconds') or job.params.get('chunk_seconds') or settings.chunk_seconds} сек."),
-            ("Overlap", f"{runtime_settings.get('chunk_overlap_seconds') or job.params.get('chunk_overlap_seconds') or settings.chunk_overlap_seconds} сек."),
+            ("Batch size", profile_settings.get("batch_size")),
             ("Loudnorm", "включен" if runtime_settings.get("enable_loudnorm", settings.enable_loudnorm) else "выключен"),
             ("Sample rate", f"{runtime_settings.get('target_sample_rate') or settings.target_sample_rate} Hz"),
         ]
     )
     stage_labels = [
         ("probe_seconds", "Анализ длительности"),
-        ("preprocess_seconds", "Подготовка аудио"),
-        ("chunk_plan_seconds", "План фрагментов"),
-        ("chunk_extract_seconds", "Нарезка фрагментов"),
-        ("chunk_transcribe_seconds", "Распознавание Whisper"),
+        ("prepare_seconds", "Подготовка аудио"),
+        ("transcribe_seconds", "Распознавание Whisper"),
         ("postprocess_seconds", "Постобработка"),
         ("export_seconds", "Экспорт файлов"),
     ]
@@ -1065,8 +1062,6 @@ def create_job(
 
     params = {
         "profile": profile,
-        "chunk_seconds": settings.chunk_seconds,
-        "chunk_overlap_seconds": settings.chunk_overlap_seconds,
         "model": settings.whisper_model,
         "compute_type": settings.whisper_compute_type,
         "language": settings.whisper_language,

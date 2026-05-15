@@ -34,28 +34,20 @@ class Settings(BaseSettings):
     whisper_language: str | None = "ru"
     whisper_task: Literal["transcribe", "translate"] = "transcribe"
 
-    # Перекрывают decode-параметры профиля (если не None). Температуры: список через запятую, напр. 0.0,0.2,0.4
+    # Перекрывают decode-параметры профиля (если не None).
+    whisper_batch_size: int | None = Field(default=None, ge=1, le=512)
     whisper_beam_size: int | None = Field(default=None, ge=1, le=32)
     whisper_best_of: int | None = Field(default=None, ge=1, le=32)
     whisper_patience: float | None = Field(default=None, ge=0.0, le=5.0)
-    whisper_length_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
-    whisper_repetition_penalty: float | None = Field(default=None, ge=1.0, le=2.0)
-    whisper_no_repeat_ngram_size: int | None = Field(default=None, ge=0, le=16)
-    whisper_prompt_reset_on_temperature: float | None = Field(default=None, ge=0.0, le=1.0)
-    whisper_temperature: str | None = None
     whisper_compression_ratio_threshold: float | None = Field(default=None, ge=0.5, le=10.0)
     whisper_log_prob_threshold: float | None = Field(default=None, ge=-10.0, le=1.0)
     whisper_no_speech_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     whisper_condition_on_previous_text: bool | None = None
     whisper_word_timestamps: bool | None = None
 
-    worker_concurrency: int = 1
     worker_poll_seconds: float = 5.0
-    worker_stale_running_minutes: int = 30
     worker_id: str | None = None
 
-    chunk_seconds: int = 1800
-    chunk_overlap_seconds: int = 15
     enable_loudnorm: bool = True
     target_sample_rate: int = 16000
 

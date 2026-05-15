@@ -10,10 +10,9 @@ PROFILES: dict[str, dict[str, Any]] = {
     "accuracy_first": {
         # Зашумлённые лекции. Приоритет — полнота, безопасность границ сегментов.
         # beam_size=5/patience=1.0 — расширенный поиск; condition_on_previous_text=False
-        # предотвращает галлюцинации на границах 30-секундных окон.
-        # no_speech_threshold=0.85: Whisper пропускает 30-сек окно только при очень высокой
-        # уверенности в тишине; значение 0.60 стабильно отбрасывало первое окно с чёткой речью.
+        # предотвращает галлюцинации на границах 30-секундных окон Whisper.
         "description": "Noisy lecture profile. Prefer recall and boundary safety over speed.",
+        "batch_size": 16,
         "beam_size": 5,
         "best_of": 5,
         "patience": 1.0,
@@ -23,12 +22,18 @@ PROFILES: dict[str, dict[str, Any]] = {
         "no_speech_threshold": 0.85,
         "condition_on_previous_text": False,
         "word_timestamps": False,
-        "vad_filter": False,
+        "vad_filter": True,
+        "vad_parameters": {
+            "threshold": 0.3,
+            "min_silence_duration_ms": 500,
+            "speech_pad_ms": 800,
+        },
     },
     "speed_balanced": {
-        "description": "Cleaner audio profile. Faster decoding with cautious VAD enabled.",
-        "beam_size": 3,
-        "best_of": 3,
+        "description": "Cleaner audio profile. Faster decoding with VAD enabled.",
+        "batch_size": 16,
+        "beam_size": 2,
+        "best_of": 2,
         "patience": 1.0,
         "temperature": [0.0, 0.2],
         "compression_ratio_threshold": 2.4,
@@ -54,6 +59,8 @@ def resolve_profile(profile_name: str, settings: Settings) -> dict[str, Any]:
     profile = deepcopy(PROFILES[profile_name])
 
     # Decode parameter overrides from .env (apply only when explicitly set).
+    if settings.whisper_batch_size is not None:
+        profile["batch_size"] = settings.whisper_batch_size
     if settings.whisper_no_speech_threshold is not None:
         profile["no_speech_threshold"] = settings.whisper_no_speech_threshold
     if settings.whisper_log_prob_threshold is not None:

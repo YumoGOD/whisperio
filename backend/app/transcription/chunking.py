@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 
 
 UNINTELLIGIBLE_TEXT = "НЕРАЗБОРЧИВО"
@@ -12,39 +11,6 @@ _ARTIFACT_PATTERNS = (
         r"^субтитры\s+(?:делал|сделал|сделала|сделали|создавал|создал|создала|создали|подготовил|подготовила|подготовили|подогнал|подогнала|подогнали)\b"
     ),
 )
-
-
-@dataclass(frozen=True, slots=True)
-class AudioChunk:
-    index: int
-    start: float
-    end: float
-
-    @property
-    def duration(self) -> float:
-        return max(0.0, self.end - self.start)
-
-
-def build_chunks(duration_seconds: float, chunk_seconds: int, overlap_seconds: int) -> list[AudioChunk]:
-    if duration_seconds <= 0:
-        return []
-    if chunk_seconds <= 0:
-        return [AudioChunk(index=0, start=0.0, end=duration_seconds)]
-    if overlap_seconds < 0 or overlap_seconds >= chunk_seconds:
-        raise ValueError("Overlap фрагментов должен быть >= 0 и меньше длины фрагмента")
-
-    chunks: list[AudioChunk] = []
-    start = 0.0
-    index = 0
-    step = chunk_seconds - overlap_seconds
-    while start < duration_seconds:
-        end = min(duration_seconds, start + chunk_seconds)
-        chunks.append(AudioChunk(index=index, start=start, end=end))
-        if end >= duration_seconds:
-            break
-        start += step
-        index += 1
-    return chunks
 
 
 def normalize_text(text: str) -> str:
@@ -156,7 +122,10 @@ def group_segments_by_sentence(
     return result
 
 
-def merge_segments(segments: list[dict], overlap_seconds: int) -> list[dict]:
+_MERGE_BOUNDARY_SECONDS = 2.0
+
+
+def merge_segments(segments: list[dict]) -> list[dict]:
     merged: list[dict] = []
     for segment in sorted(segments, key=lambda item: (item["start"], item["end"])):
         text = normalize_text(segment.get("text", ""))
@@ -168,8 +137,7 @@ def merge_segments(segments: list[dict], overlap_seconds: int) -> list[dict]:
             continue
 
         previous = merged[-1]
-        boundary_window = max(2.0, float(overlap_seconds) + 2.0)
-        starts_near_previous = candidate["start"] <= previous["end"] + boundary_window
+        starts_near_previous = candidate["start"] <= previous["end"] + _MERGE_BOUNDARY_SECONDS
         same_text = text.lower() == normalize_text(previous.get("text", "")).lower()
         contained_text = text.lower() in normalize_text(previous.get("text", "")).lower()
         previous_contained = normalize_text(previous.get("text", "")).lower() in text.lower()

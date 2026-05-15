@@ -8,11 +8,11 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
 
-from faster_whisper import WhisperModel
+from faster_whisper import BatchedInferencePipeline, WhisperModel
 
 from app.config import Settings
-from app.transcription.audio import extract_chunk, probe_duration_seconds
-from app.transcription.chunking import build_chunks, group_segments_by_sentence, merge_segments, normalize_text, replace_transcript_artifacts
+from app.transcription.audio import prepare_audio, probe_duration_seconds
+from app.transcription.chunking import group_segments_by_sentence, merge_segments, normalize_text, replace_transcript_artifacts
 from app.transcription.exports import write_exports
 from app.transcription.glossary import (
     GlossaryContext,
@@ -33,49 +33,13 @@ def elapsed_since(started_at: float) -> float:
     return round(perf_counter() - started_at, 3)
 
 
-def _to_int_param(value: Any, fallback: int) -> int:
-    """Convert a user-supplied param to int safely; falls back on non-numeric input."""
-    try:
-        return max(1, int(float(value)))
-    except (TypeError, ValueError):
-        return fallback
-
-
-def _build_context_tail(segments: list[dict[str, Any]], max_chars: int = 400) -> str | None:
-    """Return the trailing text of processed segments to use as inter-chunk context."""
-    if not segments:
-        return None
-    parts: list[str] = []
-    total = 0
-    for seg in reversed(segments[-10:]):
-        text = seg.get("text", "").strip()
-        if not text:
-            continue
-        if total + len(text) + 1 > max_chars:
-            break
-        parts.insert(0, text)
-        total += len(text) + 1
-    return " ".join(parts) if parts else None
-
-
-def _merge_prompts(tail: str | None, glossary_prompt: str, max_chars: int = 1400) -> str:
-    """Combine prev-chunk tail (priority) and glossary prompt within max_chars."""
-    if not tail:
-        return glossary_prompt[:max_chars]
-    tail = tail[:max_chars]
-    remaining = max_chars - len(tail) - 1
-    if glossary_prompt and remaining > 20:
-        return f"{tail} {glossary_prompt[:remaining]}"
-    return tail
-
-
 class TranscriptionPipeline:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self._model: WhisperModel | None = None
+        self._model: BatchedInferencePipeline | None = None
 
     @property
-    def model(self) -> WhisperModel:
+    def model(self) -> BatchedInferencePipeline:
         if self._model is None:
             model_name = self.settings.whisper_model
             logger.info(
@@ -86,7 +50,7 @@ class TranscriptionPipeline:
                 self.settings.whisper_num_workers,
             )
             try:
-                self._model = WhisperModel(
+                whisper_model = WhisperModel(
                     model_name,
                     device=self.settings.whisper_device,
                     compute_type=self.settings.whisper_compute_type,
@@ -95,6 +59,7 @@ class TranscriptionPipeline:
                     if self.settings.whisper_download_root
                     else None,
                 )
+                self._model = BatchedInferencePipeline(whisper_model)
             except Exception as exc:
                 download_root = self.settings.whisper_download_root or Path("./data/models")
                 raise RuntimeError(
@@ -122,12 +87,7 @@ class TranscriptionPipeline:
         profile = resolve_profile(profile_name, self.settings)
         glossary_context = build_glossary_context(self.settings, params)
         job_work_dir = self.settings.work_dir / job_id
-        chunk_dir = job_work_dir / "chunks"
         transcript_dir = self.settings.transcript_dir / job_id
-
-        # Safe float→int conversion: guards against "1800.5" or similar user input.
-        chunk_seconds = _to_int_param(params.get("chunk_seconds"), self.settings.chunk_seconds)
-        overlap_seconds = _to_int_param(params.get("chunk_overlap_seconds"), self.settings.chunk_overlap_seconds)
 
         stage_started = perf_counter()
         self._progress(progress_callback, 0.05, "анализ длительности")
@@ -135,16 +95,15 @@ class TranscriptionPipeline:
         probe_elapsed = elapsed_since(stage_started)
 
         stage_started = perf_counter()
-        chunks = build_chunks(
-            duration_seconds=duration_seconds,
-            chunk_seconds=chunk_seconds,
-            overlap_seconds=overlap_seconds,
-        )
-        if not chunks:
-            raise RuntimeError("Не удалось определить длительность аудиофайла")
-        chunk_plan_elapsed = elapsed_since(stage_started)
+        self._progress(progress_callback, 0.10, "подготовка аудио")
+        if self.settings.enable_loudnorm:
+            prepared_path = job_work_dir / "audio_prepared.wav"
+            prepared_path.parent.mkdir(parents=True, exist_ok=True)
+            actual_audio = prepare_audio(input_path, prepared_path, self.settings)
+        else:
+            actual_audio = input_path
+        prepare_elapsed = elapsed_since(stage_started)
 
-        all_segments: list[dict[str, Any]] = []
         diagnostics: dict[str, Any] = {
             "job_id": job_id,
             "original_filename": original_filename,
@@ -157,7 +116,6 @@ class TranscriptionPipeline:
             },
             "glossary": glossary_context.diagnostics(),
             "duration_seconds": duration_seconds,
-            "chunks": [],
             "settings": {
                 "model": self.settings.whisper_model,
                 "device": self.settings.whisper_device,
@@ -166,106 +124,71 @@ class TranscriptionPipeline:
                 "task": self.settings.whisper_task,
                 "target_sample_rate": self.settings.target_sample_rate,
                 "enable_loudnorm": self.settings.enable_loudnorm,
-                "chunk_seconds": chunk_seconds,
-                "chunk_overlap_seconds": overlap_seconds,
             },
             "stage_timings": {
                 "probe_seconds": probe_elapsed,
-                "chunk_plan_seconds": chunk_plan_elapsed,
-                "chunk_extract_seconds": 0.0,
-                "chunk_transcribe_seconds": 0.0,
+                "prepare_seconds": prepare_elapsed,
+                "transcribe_seconds": 0.0,
                 "postprocess_seconds": 0.0,
                 "export_seconds": 0.0,
             },
         }
 
         try:
-            prev_tail_text: str | None = None
-            for chunk in chunks:
-                chunk_progress_start = 0.15 + 0.75 * (chunk.index / len(chunks))
-                self._progress(progress_callback, chunk_progress_start, f"фрагмент {chunk.index + 1}/{len(chunks)}")
-                chunk_path = chunk_dir / f"chunk_{chunk.index:04d}_{int(chunk.start)}_{int(chunk.end)}.wav"
-                extract_started = perf_counter()
-                extract_chunk(input_path, chunk_path, chunk.start, chunk.duration, self.settings)
-                extract_elapsed = elapsed_since(extract_started)
-                transcribe_started = perf_counter()
-                profile_attempt = dict(profile)
-                for attempt in range(3):
+            self._progress(progress_callback, 0.15, "транскрибация")
+            stage_started = perf_counter()
+            profile_attempt = dict(profile)
+            segments: list[dict[str, Any]] = []
+            info: Any = None
+            for attempt in range(3):
+                try:
+                    segments, info = self._transcribe_file(actual_audio, profile_attempt, glossary_context)
+                    break
+                except Exception as exc:
+                    logger.warning("Попытка %d/3 не удалась: %s", attempt + 1, exc)
+                    if attempt == 2:
+                        raise
                     try:
-                        segments, info = self._transcribe_chunk(
-                            chunk_path, chunk.start, profile_attempt, glossary_context, prev_tail_text
-                        )
-                        break
-                    except Exception as exc:
-                        logger.warning(
-                            "Чанк %s: попытка %d/3 не удалась: %s", chunk_path.name, attempt + 1, exc
-                        )
-                        if attempt == 2:
-                            raise
-                        try:
-                            import torch
-                            torch.cuda.empty_cache()
-                        except ImportError:
-                            pass
-                        if attempt == 0:
-                            profile_attempt["beam_size"] = max(1, profile["beam_size"] - 2)
-                            profile_attempt["best_of"] = max(1, profile["best_of"] - 2)
-                        else:
-                            profile_attempt["beam_size"] = 1
-                            profile_attempt["best_of"] = 1
-                            profile_attempt["temperature"] = [0.0]
+                        import torch
+                        torch.cuda.empty_cache()
+                    except ImportError:
+                        pass
+                    if attempt == 0:
+                        profile_attempt["beam_size"] = max(1, profile["beam_size"] - 2)
+                        profile_attempt["best_of"] = max(1, profile["best_of"] - 2)
+                    else:
+                        profile_attempt["beam_size"] = 1
+                        profile_attempt["best_of"] = 1
+                        profile_attempt["temperature"] = [0.0]
 
-                # Если первый чанк не дал сегментов в первых 30с при наличии initial_prompt —
-                # повтор без промпта: промпт может сбивать декодер Whisper на первом окне.
-                if chunk.index == 0 and (glossary_context.initial_prompt or prev_tail_text):
-                    has_early = any(s["start"] < chunk.start + 30.0 for s in segments)
-                    if not has_early:
-                        logger.warning(
-                            "Первый чанк: нет сегментов до %.0fс — повтор без initial_prompt "
-                            "(промпт может мешать Whisper на первом 30-сек окне)",
-                            chunk.start + 30.0,
-                        )
-                        segments_retry, _ = self._transcribe_chunk(
-                            chunk_path, chunk.start, profile_attempt, glossary_context,
-                            prev_tail_text=None, use_initial_prompt=False,
-                        )
-                        if segments_retry:
-                            segments = segments_retry
-                            logger.info(
-                                "Повтор без промпта успешен: %d сегментов, первый в %.1fс",
-                                len(segments_retry), segments_retry[0]["start"],
-                            )
+            # Если нет сегментов в первых 30с и есть initial_prompt — повтор без промпта.
+            # Включает случай пустого списка: промпт может сбивать первое 30-сек окно Whisper.
+            if glossary_context.initial_prompt and not any(s["start"] < 30.0 for s in segments):
+                logger.warning(
+                    "Нет сегментов до 30с — повтор без initial_prompt "
+                    "(промпт может мешать Whisper на первом 30-сек окне)"
+                )
+                segments_retry, _ = self._transcribe_file(
+                    actual_audio, profile_attempt, glossary_context, use_initial_prompt=False
+                )
+                if segments_retry:
+                    segments = segments_retry
+                    logger.info(
+                        "Повтор без промпта успешен: %d сегментов, первый в %.1fс",
+                        len(segments_retry), segments_retry[0]["start"],
+                    )
 
-                prev_tail_text = _build_context_tail(segments)
-                transcribe_elapsed = elapsed_since(transcribe_started)
-                diagnostics["stage_timings"]["chunk_extract_seconds"] = round(
-                    diagnostics["stage_timings"]["chunk_extract_seconds"] + extract_elapsed,
-                    3,
-                )
-                diagnostics["stage_timings"]["chunk_transcribe_seconds"] = round(
-                    diagnostics["stage_timings"]["chunk_transcribe_seconds"] + transcribe_elapsed,
-                    3,
-                )
-                all_segments.extend(segments)
-                diagnostics["chunks"].append(
-                    {
-                        "index": chunk.index,
-                        "start": chunk.start,
-                        "end": chunk.end,
-                        "path": str(chunk_path),
-                        "segments": len(segments),
-                        "extract_seconds": extract_elapsed,
-                        "transcribe_seconds": transcribe_elapsed,
-                        "audio_seconds": round(chunk.duration, 3),
-                        "real_time_factor": round(transcribe_elapsed / chunk.duration, 4) if chunk.duration else None,
-                        "language": getattr(info, "language", None),
-                        "language_probability": getattr(info, "language_probability", None),
-                    }
-                )
+            transcribe_elapsed = elapsed_since(stage_started)
+            diagnostics["stage_timings"]["transcribe_seconds"] = transcribe_elapsed
+            diagnostics["transcribe"] = {
+                "segments_raw": len(segments),
+                "language": getattr(info, "language", None),
+                "language_probability": getattr(info, "language_probability", None),
+            }
 
             stage_started = perf_counter()
             self._progress(progress_callback, 0.92, "постобработка")
-            merged_segments = merge_segments(all_segments, overlap_seconds)
+            merged_segments = merge_segments(segments)
             merged_segments, artifact_stats = replace_transcript_artifacts(merged_segments)
             merged_segments = group_segments_by_sentence(merged_segments)
             full_text = " ".join(segment["text"] for segment in merged_segments)
@@ -283,7 +206,6 @@ class TranscriptionPipeline:
             )
             diagnostics["stage_timings"]["export_seconds"] = elapsed_since(stage_started)
 
-            # Finalize all timings before writing JSON — written exactly once with complete data.
             elapsed_seconds = perf_counter() - started
             diagnostics["elapsed_seconds"] = round(elapsed_seconds, 3)
             diagnostics["real_time_factor"] = round(elapsed_seconds / duration_seconds, 4) if duration_seconds else None
@@ -296,10 +218,9 @@ class TranscriptionPipeline:
                 encoding="utf-8",
             )
         finally:
-            # Always clean up chunk WAVs — on success and on error.
-            if chunk_dir.exists():
-                shutil.rmtree(chunk_dir, ignore_errors=True)
-                logger.info("Удалены временные WAV-фрагменты: %s", chunk_dir)
+            if job_work_dir.exists():
+                shutil.rmtree(job_work_dir, ignore_errors=True)
+                logger.info("Удалены временные файлы: %s", job_work_dir)
 
         self._progress(progress_callback, 0.98, "сохранение результатов")
         return {
@@ -312,18 +233,17 @@ class TranscriptionPipeline:
             "diagnostics": diagnostics,
         }
 
-    def _transcribe_chunk(
+    def _transcribe_file(
         self,
-        chunk_path: Path,
-        offset_seconds: float,
+        audio_path: Path,
         profile: dict[str, Any],
         glossary_context: GlossaryContext,
-        prev_tail_text: str | None = None,
         use_initial_prompt: bool = True,
     ):
-        vad_filter = bool(profile.get("vad_filter", False))
+        vad_filter = bool(profile.get("vad_filter", True))
         vad_parameters = profile.get("vad_parameters") if vad_filter else None
         transcribe_kwargs: dict[str, Any] = {
+            "batch_size": int(profile.get("batch_size", 16)),
             "beam_size": int(profile["beam_size"]),
             "best_of": int(profile["best_of"]),
             "patience": float(profile["patience"]),
@@ -338,33 +258,29 @@ class TranscriptionPipeline:
             "vad_filter": vad_filter,
             "vad_parameters": vad_parameters,
         }
-        if use_initial_prompt and (prev_tail_text or glossary_context.initial_prompt):
-            transcribe_kwargs["initial_prompt"] = _merge_prompts(
-                prev_tail_text,
-                glossary_context.initial_prompt,
-                self.settings.glossary_prompt_max_chars,
-            )
+        if use_initial_prompt and glossary_context.initial_prompt:
+            transcribe_kwargs["initial_prompt"] = glossary_context.initial_prompt[: self.settings.glossary_prompt_max_chars]
         if self.settings.glossary_enable_hotwords and glossary_context.hotwords and self._supports_hotwords():
             transcribe_kwargs["hotwords"] = ",".join(glossary_context.hotwords)
 
         logger.debug(
-            "Транскрибация чанка offset=%.0fс: no_speech_thr=%.2f log_prob_thr=%.2f vad=%s prompt=%s",
-            offset_seconds,
+            "Транскрибация: no_speech_thr=%.2f log_prob_thr=%.2f vad=%s batch_size=%d prompt=%s",
             float(profile["no_speech_threshold"]),
             float(profile["log_prob_threshold"]),
             vad_filter,
+            int(profile.get("batch_size", 16)),
             repr(transcribe_kwargs["initial_prompt"][:60]) if "initial_prompt" in transcribe_kwargs else "нет",
         )
 
-        segments_iter, info = self.model.transcribe(str(chunk_path), **transcribe_kwargs)
+        segments_iter, info = self.model.transcribe(str(audio_path), **transcribe_kwargs)
         segments: list[dict[str, Any]] = []
         raw_count = 0
         first_raw_start: float | None = None
 
         for segment in segments_iter:
             raw_count += 1
-            seg_start = float(segment.start) + offset_seconds
-            seg_end = float(segment.end) + offset_seconds
+            seg_start = float(segment.start)
+            seg_end = float(segment.end)
             if first_raw_start is None:
                 first_raw_start = seg_start
             text = normalize_text(segment.text)
@@ -428,25 +344,17 @@ class TranscriptionPipeline:
 
         if raw_count == 0:
             logger.warning(
-                "Чанк offset=%.0fс: faster-whisper не выдал НИ ОДНОГО сегмента. "
+                "faster-whisper не выдал НИ ОДНОГО сегмента. "
                 "no_speech_threshold=%.2f log_prob_threshold=%.2f vad=%s prompt=%s",
-                offset_seconds,
                 float(profile["no_speech_threshold"]),
                 float(profile["log_prob_threshold"]),
                 vad_filter,
                 "да" if "initial_prompt" in transcribe_kwargs else "нет",
             )
-        elif first_raw_start is not None and first_raw_start >= offset_seconds + 29.0:
-            logger.warning(
-                "Чанк offset=%.0fс: Whisper пропустил первое 30-сек окно — "
-                "первый сегмент начинается в %.1fс (ожидается ~%.1fс). "
-                "no_speech_prob и avg_logprob выше смотрите в DEBUG-логах.",
-                offset_seconds, first_raw_start, offset_seconds,
-            )
         else:
             logger.info(
-                "Чанк offset=%.0fс: %d сырых сег → %d после фильтров%s",
-                offset_seconds, raw_count, len(segments),
+                "%d сырых сег → %d после фильтров%s",
+                raw_count, len(segments),
                 f" | первый в {first_raw_start:.1f}с" if first_raw_start is not None else "",
             )
 

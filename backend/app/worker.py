@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import logging
 import os
-import queue
 import signal
 import socket
 import time
 import traceback
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from app.config import get_settings
@@ -25,7 +23,7 @@ stop_requested = False
 
 def request_stop(signum, _frame) -> None:
     global stop_requested
-    logger.info("Получен сигнал %s, остановка после завершения активных задач", signum)
+    logger.info("Получен сигнал %s, остановка после завершения активной задачи", signum)
     stop_requested = True
 
 
@@ -33,9 +31,8 @@ def worker_id() -> str:
     return settings.worker_id or f"{socket.gethostname()}-{os.getpid()}"
 
 
-def process_job(job: Job, repo: JobRepository, worker_name: str, pipeline_pool: "queue.Queue[TranscriptionPipeline]") -> None:
+def process_job(job: Job, repo: JobRepository, worker_name: str, pipeline: TranscriptionPipeline) -> None:
     logger.info("Запуск задачи %s (%s)", job.id, job.original_filename)
-    pipeline = pipeline_pool.get()
 
     def progress(pct: float, stage: str) -> None:
         repo.update_progress(job.id, pct, status="running")
@@ -61,8 +58,6 @@ def process_job(job: Job, repo: JobRepository, worker_name: str, pipeline_pool: 
     except Exception as exc:
         logger.error("Задача %s завершилась ошибкой: %s\n%s", job.id, exc, traceback.format_exc())
         repo.fail_job(job.id, str(exc))
-    finally:
-        pipeline_pool.put(pipeline)
 
 
 def main() -> None:
@@ -73,56 +68,20 @@ def main() -> None:
     name = worker_id()
     recovered = repo.recover_running_jobs(worker_id=name)
     if recovered:
-        logger.info("Восстановлено незавершенных задач после перезапуска: %s", recovered)
+        logger.info("Восстановлено незавершённых задач после перезапуска: %s", recovered)
 
-    concurrency = max(1, settings.worker_concurrency)
-    logger.info(
-        "Worker %s запущен: параллельных задач=%d, интервал опроса=%s сек.",
-        name,
-        concurrency,
-        settings.worker_poll_seconds,
-    )
+    logger.info("Worker %s запущен, интервал опроса=%.1f сек.", name, settings.worker_poll_seconds)
 
-    # Каждый слот получает собственный TranscriptionPipeline (и свою копию WhisperModel),
-    # что устраняет race condition CTranslate2 при concurrency > 1.
-    # Модели загружаются лениво — при первой задаче в каждом слоте.
-    pipeline_pool: queue.Queue[TranscriptionPipeline] = queue.Queue()
-    for _ in range(concurrency):
-        pipeline_pool.put(TranscriptionPipeline(settings))
+    # Модель загружается лениво — при первой задаче.
+    pipeline = TranscriptionPipeline(settings)
 
-    if concurrency > 1:
-        logger.info(
-            "Параллельный режим: %d независимых pipeline. "
-            "Убедитесь, что GPU имеет достаточно VRAM для %d экземпляров модели одновременно.",
-            concurrency,
-            concurrency,
-        )
+    while not stop_requested:
+        job = repo.claim_next_job(name)
+        if job is None:
+            time.sleep(settings.worker_poll_seconds)
+            continue
+        process_job(job, repo, name, pipeline)
 
-    active: set[Future] = set()
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        while not stop_requested:
-            active = {future for future in active if not future.done()}
-            while len(active) < concurrency:
-                job = repo.claim_next_job(name)
-                if job is None:
-                    break
-                active.add(executor.submit(process_job, job, repo, name, pipeline_pool))
-
-            if active:
-                done, active = wait(active, timeout=settings.worker_poll_seconds, return_when=FIRST_COMPLETED)
-                for future in done:
-                    try:
-                        future.result()
-                    except Exception:
-                        # process_job handles all exceptions internally (logs + fail_job).
-                        # Re-raising here would kill the worker loop.
-                        pass
-            else:
-                time.sleep(settings.worker_poll_seconds)
-
-    if active:
-        logger.info("Ожидание завершения активных задач перед остановкой: %s", len(active))
-        wait(active)
     logger.info("Worker %s остановлен", name)
 
 

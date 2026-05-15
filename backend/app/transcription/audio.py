@@ -48,24 +48,20 @@ def probe_duration_seconds(path: Path) -> float:
         raise AudioProcessingError(f"Не удалось прочитать длительность аудио: {path}") from exc
 
 
-def extract_chunk(input_path: Path, output_path: Path, start: float, duration: float, settings: Settings) -> Path:
+def prepare_audio(input_path: Path, output_path: Path, settings: Settings) -> Path:
+    """Convert entire audio file to 16 kHz mono WAV with optional voice filter.
+
+    Voice filter: highpass=f=200 removes sub-200 Hz rumble; volume=1.5 boosts quiet recordings.
+    lowpass=8000 is intentionally omitted — redundant when resampling to 16 kHz (Nyquist = 8 kHz).
+    """
     if output_path.exists() and output_path.stat().st_size > 0:
         return output_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    filters = []
-    if settings.enable_loudnorm:
-        # Voice filter: removes sub-200 Hz rumble, boosts quiet audio by 1.5x.
-        # lowpass=8000 is intentionally omitted — redundant when resampling to 16 kHz (Nyquist = 8 kHz).
-        filters.append("highpass=f=200,volume=1.5")
 
     cmd = [
         "ffmpeg",
         "-y",
         "-hide_banner",
-        "-ss",
-        f"{start:.3f}",
-        "-t",
-        f"{duration:.3f}",
         "-i",
         str(input_path),
         "-vn",
@@ -74,11 +70,10 @@ def extract_chunk(input_path: Path, output_path: Path, start: float, duration: f
         "-ar",
         str(settings.target_sample_rate),
     ]
-    if filters:
-        cmd += ["-af", ",".join(filters)]
+    if settings.enable_loudnorm:
+        cmd += ["-af", "highpass=f=200,volume=1.5"]
     cmd += ["-c:a", "pcm_s16le", str(output_path)]
 
-    # Timeout: 10× real-time, minimum 2 minutes. Prevents worker thread deadlock on corrupt files.
-    ffmpeg_timeout = max(120, int(duration * 10))
-    run_command(cmd, timeout=ffmpeg_timeout)
+    # Timeout: generous upper bound for very long files (10 hours max).
+    run_command(cmd, timeout=3600)
     return output_path

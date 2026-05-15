@@ -32,8 +32,6 @@ def main() -> int:
 
     params = {
         "profile": args.profile or settings.default_profile,
-        "chunk_seconds": settings.chunk_seconds,
-        "chunk_overlap_seconds": settings.chunk_overlap_seconds,
         "model": settings.whisper_model,
         "compute_type": settings.whisper_compute_type,
     }
