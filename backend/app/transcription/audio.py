@@ -55,6 +55,10 @@ def extract_chunk(input_path: Path, output_path: Path, start: float, duration: f
         "ffmpeg",
         "-y",
         "-hide_banner",
+        "-ss",
+        f"{start:.3f}",
+        "-t",
+        f"{duration:.3f}",
         "-i",
         str(input_path),
         "-vn",
@@ -68,27 +72,4 @@ def extract_chunk(input_path: Path, output_path: Path, start: float, duration: f
     cmd += ["-c:a", "pcm_s16le", str(output_path)]
 
     run_command(cmd)
-    return output_path
-
-
-def extract_chunk(input_path: Path, output_path: Path, start: float, duration: float) -> Path:
-    if output_path.exists() and output_path.stat().st_size > 0:
-        return output_path
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    run_command(
-        [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-ss",
-            f"{start:.3f}",
-            "-t",
-            f"{duration:.3f}",
-            "-i",
-            str(input_path),
-            "-c:a",
-            "copy",
-            str(output_path),
-        ]
-    )
     return output_path

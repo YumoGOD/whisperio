@@ -9,36 +9,19 @@ from app.config import Settings
 PROFILES: dict[str, dict[str, Any]] = {
     "accuracy_first": {
         # Зашумлённые лекции. Приоритет — полнота, безопасность границ сегментов.
-        # beam_size=5/patience=1.2 — расширенный поиск; condition_on_previous_text=False
+        # beam_size=5/patience=1.0 — расширенный поиск; condition_on_previous_text=False
         # предотвращает галлюцинации на границах 30-секундных окон.
-        # vad_filter=True — Silero VAD отсекает музыку/фон, предотвращая галлюцинации
-        # на немузыкальных сегментах.
         "description": "Noisy lecture profile. Prefer recall and boundary safety over speed.",
         "beam_size": 5,
         "best_of": 5,
-<<<<<<< HEAD
         "patience": 1.0,
         "temperature": [0.0, 0.2, 0.4, 0.6],
         "compression_ratio_threshold": 2.4,
         "log_prob_threshold": -1.0,
-        "no_speech_threshold": 0.85,
+        "no_speech_threshold": 0.60,
         "condition_on_previous_text": False,
         "word_timestamps": False,
-=======
-        "patience": 1.2,
-        "temperature": [0.0, 0.2, 0.4],
-        "compression_ratio_threshold": 2.4,
-        "log_prob_threshold": -1.2,
-        "no_speech_threshold": 0.60,
-        "condition_on_previous_text": True,
-        "word_timestamps": True,
-        "vad_filter": True,
-        # threshold=0.20 catches quiet/muffled speech; wide pads prevent mid-word cuts.
-        "vad_parameters": {
-            "threshold": 0.20,
-            "min_silence_duration_ms": 1500,
-            "speech_pad_ms": 800,
-        },
+        "vad_filter": False,
     },
     "speed_balanced": {
         "description": "Cleaner audio profile. Faster decoding with cautious VAD enabled.",
@@ -48,10 +31,9 @@ PROFILES: dict[str, dict[str, Any]] = {
         "temperature": [0.0, 0.2],
         "compression_ratio_threshold": 2.4,
         "log_prob_threshold": -1.0,
-        "no_speech_threshold": 0.75,
-        "condition_on_previous_text": True,
-        "word_timestamps": True,
->>>>>>> claude/dreamy-mahavira-7fbc0f
+        "no_speech_threshold": 0.60,
+        "condition_on_previous_text": False,
+        "word_timestamps": False,
         "vad_filter": True,
         "vad_parameters": {
             "threshold": 0.3,

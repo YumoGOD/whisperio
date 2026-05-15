@@ -55,13 +55,8 @@ class Settings(BaseSettings):
     worker_id: str | None = None
 
     chunk_seconds: int = 1800
-<<<<<<< HEAD
-    chunk_overlap_seconds: int = 45
-    enable_loudnorm: bool = True
-=======
     chunk_overlap_seconds: int = 15
-    enable_loudnorm: bool = False
->>>>>>> claude/zealous-kare-20eb80
+    enable_loudnorm: bool = True
     target_sample_rate: int = 16000
 
     vad_filter: bool | None = None
