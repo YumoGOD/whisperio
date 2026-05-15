@@ -51,8 +51,9 @@ def probe_duration_seconds(path: Path) -> float:
 def prepare_audio(input_path: Path, output_path: Path, settings: Settings) -> Path:
     """Convert entire audio file to 16 kHz mono WAV with optional voice filter.
 
-    Voice filter: highpass=f=200 removes sub-200 Hz rumble; volume=1.5 boosts quiet recordings.
-    lowpass=8000 is intentionally omitted — redundant when resampling to 16 kHz (Nyquist = 8 kHz).
+    Voice filter: highpass=f=200 removes sub-200 Hz rumble; loudnorm normalises to EBU R128
+    (-16 LUFS integrated, -1.5 dBTP peak) — handles quietly recorded files much better than
+    a fixed volume boost. lowpass=8000 omitted — redundant at 16 kHz (Nyquist = 8 kHz).
     """
     if output_path.exists() and output_path.stat().st_size > 0:
         return output_path
@@ -71,7 +72,7 @@ def prepare_audio(input_path: Path, output_path: Path, settings: Settings) -> Pa
         str(settings.target_sample_rate),
     ]
     if settings.enable_loudnorm:
-        cmd += ["-af", "highpass=f=200,volume=1.5"]
+        cmd += ["-af", "highpass=f=200,loudnorm=I=-16:TP=-1.5:LRA=11"]
     cmd += ["-c:a", "pcm_s16le", str(output_path)]
 
     # Timeout: generous upper bound for very long files (10 hours max).

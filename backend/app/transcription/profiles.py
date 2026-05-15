@@ -8,25 +8,34 @@ from app.config import Settings
 
 PROFILES: dict[str, dict[str, Any]] = {
     "accuracy_first": {
-        # Зашумлённые лекции. Приоритет — полнота, безопасность границ сегментов.
-        # beam_size=5/patience=1.0 — расширенный поиск; condition_on_previous_text=False
-        # предотвращает галлюцинации на границах 30-секундных окон Whisper.
-        "description": "Noisy lecture profile. Prefer recall and boundary safety over speed.",
+        # Тихое/зашумлённое аудио низкого качества. Приоритет — полнота транскрипта.
+        #
+        # no_speech_threshold=0.90: Whisper пропускает 30-сек окно только если уверен на 90%,
+        #   что там тишина — иначе тихая речь с no_speech_prob~0.87 терялась бы.
+        # log_prob_threshold=-2.0: принимаем сегменты с низкой уверенностью (деградированный
+        #   сигнал даёт плохие log prob); VAD уже отфильтровал чистую тишину.
+        # temperature=[0.0..0.8]: 5 ступеней фоллбека — Whisper пробует более высокую
+        #   температуру когда compression_ratio слишком высокий (петля/шум).
+        # condition_on_previous_text=False: каждое 30-сек окно независимо — плохое окно
+        #   не отравляет контекст для следующих.
+        # VAD threshold=0.2: Silero считает речью всё с вероятностью ≥20% (вместо 30%),
+        #   speech_pad_ms=1000 захватывает 1 с вокруг каждого сегмента.
+        "description": "Quiet/low-quality audio profile. Maximum recall, safe segment boundaries.",
         "batch_size": 16,
         "beam_size": 5,
         "best_of": 5,
         "patience": 1.0,
-        "temperature": [0.0, 0.2, 0.4, 0.6],
+        "temperature": [0.0, 0.2, 0.4, 0.6, 0.8],
         "compression_ratio_threshold": 2.4,
-        "log_prob_threshold": -1.5,
-        "no_speech_threshold": 0.85,
+        "log_prob_threshold": -2.0,
+        "no_speech_threshold": 0.90,
         "condition_on_previous_text": False,
         "word_timestamps": False,
         "vad_filter": True,
         "vad_parameters": {
-            "threshold": 0.3,
-            "min_silence_duration_ms": 500,
-            "speech_pad_ms": 800,
+            "threshold": 0.2,
+            "min_silence_duration_ms": 600,
+            "speech_pad_ms": 1000,
         },
     },
     "speed_balanced": {
@@ -43,9 +52,9 @@ PROFILES: dict[str, dict[str, Any]] = {
         "word_timestamps": False,
         "vad_filter": True,
         "vad_parameters": {
-            "threshold": 0.3,
-            "min_silence_duration_ms": 300,
-            "speech_pad_ms": 600,
+            "threshold": 0.25,
+            "min_silence_duration_ms": 400,
+            "speech_pad_ms": 800,
         },
     },
 }
