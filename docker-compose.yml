@@ -24,4 +24,4 @@ services:
       - ./data:/app/data
     restart: unless-stopped
     depends_on:
-      - api
+      - api  # порядок запуска; оба сервиса независимы через общий SQLite volume (без health-check)

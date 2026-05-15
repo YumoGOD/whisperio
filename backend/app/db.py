@@ -19,7 +19,6 @@ class JobRepository:
     def connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.database_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA foreign_keys=ON")
         try:
@@ -29,6 +28,7 @@ class JobRepository:
 
     def init_db(self) -> None:
         with self.connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS jobs (
@@ -90,9 +90,28 @@ class JobRepository:
             ).fetchall()
         return [self._row_to_job(row) for row in rows]
 
-    def recover_running_jobs(self, stale_minutes: int | None = None) -> int:
+    def recover_running_jobs(
+        self,
+        worker_id: str | None = None,
+        stale_minutes: int | None = None,
+    ) -> int:
         with self.connect() as conn:
-            if stale_minutes is None:
+            if worker_id is not None:
+                # On restart: reset only this worker's own jobs (safe for multi-worker).
+                cursor = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'pending',
+                        worker_id = NULL,
+                        heartbeat_at = NULL,
+                        error = NULL
+                    WHERE status = 'running'
+                      AND worker_id = ?
+                    """,
+                    (worker_id,),
+                )
+            elif stale_minutes is None:
+                # Reset ALL running jobs regardless of age (single-worker only!).
                 cursor = conn.execute(
                     """
                     UPDATE jobs

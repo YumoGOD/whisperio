@@ -33,6 +33,14 @@ def elapsed_since(started_at: float) -> float:
     return round(perf_counter() - started_at, 3)
 
 
+def _to_int_param(value: Any, fallback: int) -> int:
+    """Convert a user-supplied param to int safely; falls back on non-numeric input."""
+    try:
+        return max(1, int(float(value)))
+    except (TypeError, ValueError):
+        return fallback
+
+
 def _build_context_tail(segments: list[dict[str, Any]], max_chars: int = 400) -> str | None:
     """Return the trailing text of processed segments to use as inter-chunk context."""
     if not segments:
@@ -117,6 +125,10 @@ class TranscriptionPipeline:
         chunk_dir = job_work_dir / "chunks"
         transcript_dir = self.settings.transcript_dir / job_id
 
+        # Safe float→int conversion: guards against "1800.5" or similar user input.
+        chunk_seconds = _to_int_param(params.get("chunk_seconds"), self.settings.chunk_seconds)
+        overlap_seconds = _to_int_param(params.get("chunk_overlap_seconds"), self.settings.chunk_overlap_seconds)
+
         stage_started = perf_counter()
         self._progress(progress_callback, 0.05, "анализ длительности")
         duration_seconds = probe_duration_seconds(input_path)
@@ -125,8 +137,8 @@ class TranscriptionPipeline:
         stage_started = perf_counter()
         chunks = build_chunks(
             duration_seconds=duration_seconds,
-            chunk_seconds=int(params.get("chunk_seconds") or self.settings.chunk_seconds),
-            overlap_seconds=int(params.get("chunk_overlap_seconds") or self.settings.chunk_overlap_seconds),
+            chunk_seconds=chunk_seconds,
+            overlap_seconds=overlap_seconds,
         )
         if not chunks:
             raise RuntimeError("Не удалось определить длительность аудиофайла")
@@ -154,8 +166,8 @@ class TranscriptionPipeline:
                 "task": self.settings.whisper_task,
                 "target_sample_rate": self.settings.target_sample_rate,
                 "enable_loudnorm": self.settings.enable_loudnorm,
-                "chunk_seconds": int(params.get("chunk_seconds") or self.settings.chunk_seconds),
-                "chunk_overlap_seconds": int(params.get("chunk_overlap_seconds") or self.settings.chunk_overlap_seconds),
+                "chunk_seconds": chunk_seconds,
+                "chunk_overlap_seconds": overlap_seconds,
             },
             "stage_timings": {
                 "probe_seconds": probe_elapsed,
@@ -167,100 +179,105 @@ class TranscriptionPipeline:
             },
         }
 
-        prev_tail_text: str | None = None
-        for chunk in chunks:
-            chunk_progress_start = 0.15 + 0.75 * (chunk.index / len(chunks))
-            self._progress(progress_callback, chunk_progress_start, f"фрагмент {chunk.index + 1}/{len(chunks)}")
-            chunk_path = chunk_dir / f"chunk_{chunk.index:04d}_{int(chunk.start)}_{int(chunk.end)}.wav"
-            extract_started = perf_counter()
-            extract_chunk(input_path, chunk_path, chunk.start, chunk.duration, self.settings)
-            extract_elapsed = elapsed_since(extract_started)
-            transcribe_started = perf_counter()
-            profile_attempt = dict(profile)
-            for attempt in range(3):
-                try:
-                    segments, info = self._transcribe_chunk(
-                        chunk_path, chunk.start, profile_attempt, glossary_context, prev_tail_text
-                    )
-                    break
-                except Exception as exc:
-                    logger.warning(
-                        "Чанк %s: попытка %d/3 не удалась: %s", chunk_path.name, attempt + 1, exc
-                    )
-                    if attempt == 2:
-                        raise
+        try:
+            prev_tail_text: str | None = None
+            for chunk in chunks:
+                chunk_progress_start = 0.15 + 0.75 * (chunk.index / len(chunks))
+                self._progress(progress_callback, chunk_progress_start, f"фрагмент {chunk.index + 1}/{len(chunks)}")
+                chunk_path = chunk_dir / f"chunk_{chunk.index:04d}_{int(chunk.start)}_{int(chunk.end)}.wav"
+                extract_started = perf_counter()
+                extract_chunk(input_path, chunk_path, chunk.start, chunk.duration, self.settings)
+                extract_elapsed = elapsed_since(extract_started)
+                transcribe_started = perf_counter()
+                profile_attempt = dict(profile)
+                for attempt in range(3):
                     try:
-                        import torch
-                        torch.cuda.empty_cache()
-                    except ImportError:
-                        pass
-                    if attempt == 0:
-                        profile_attempt["beam_size"] = max(1, profile["beam_size"] - 2)
-                        profile_attempt["best_of"] = max(1, profile["best_of"] - 2)
-                    else:
-                        profile_attempt["beam_size"] = 1
-                        profile_attempt["best_of"] = 1
-                        profile_attempt["temperature"] = [0.0]
-            prev_tail_text = _build_context_tail(segments)
-            transcribe_elapsed = elapsed_since(transcribe_started)
-            diagnostics["stage_timings"]["chunk_extract_seconds"] = round(
-                diagnostics["stage_timings"]["chunk_extract_seconds"] + extract_elapsed,
-                3,
-            )
-            diagnostics["stage_timings"]["chunk_transcribe_seconds"] = round(
-                diagnostics["stage_timings"]["chunk_transcribe_seconds"] + transcribe_elapsed,
-                3,
-            )
-            all_segments.extend(segments)
-            diagnostics["chunks"].append(
-                {
-                    "index": chunk.index,
-                    "start": chunk.start,
-                    "end": chunk.end,
-                    "path": str(chunk_path),
-                    "segments": len(segments),
-                    "extract_seconds": extract_elapsed,
-                    "transcribe_seconds": transcribe_elapsed,
-                    "audio_seconds": round(chunk.duration, 3),
-                    "real_time_factor": round(transcribe_elapsed / chunk.duration, 4) if chunk.duration else None,
-                    "language": getattr(info, "language", None),
-                    "language_probability": getattr(info, "language_probability", None),
-                }
-            )
+                        segments, info = self._transcribe_chunk(
+                            chunk_path, chunk.start, profile_attempt, glossary_context, prev_tail_text
+                        )
+                        break
+                    except Exception as exc:
+                        logger.warning(
+                            "Чанк %s: попытка %d/3 не удалась: %s", chunk_path.name, attempt + 1, exc
+                        )
+                        if attempt == 2:
+                            raise
+                        try:
+                            import torch
+                            torch.cuda.empty_cache()
+                        except ImportError:
+                            pass
+                        if attempt == 0:
+                            profile_attempt["beam_size"] = max(1, profile["beam_size"] - 2)
+                            profile_attempt["best_of"] = max(1, profile["best_of"] - 2)
+                        else:
+                            profile_attempt["beam_size"] = 1
+                            profile_attempt["best_of"] = 1
+                            profile_attempt["temperature"] = [0.0]
+                prev_tail_text = _build_context_tail(segments)
+                transcribe_elapsed = elapsed_since(transcribe_started)
+                diagnostics["stage_timings"]["chunk_extract_seconds"] = round(
+                    diagnostics["stage_timings"]["chunk_extract_seconds"] + extract_elapsed,
+                    3,
+                )
+                diagnostics["stage_timings"]["chunk_transcribe_seconds"] = round(
+                    diagnostics["stage_timings"]["chunk_transcribe_seconds"] + transcribe_elapsed,
+                    3,
+                )
+                all_segments.extend(segments)
+                diagnostics["chunks"].append(
+                    {
+                        "index": chunk.index,
+                        "start": chunk.start,
+                        "end": chunk.end,
+                        "path": str(chunk_path),
+                        "segments": len(segments),
+                        "extract_seconds": extract_elapsed,
+                        "transcribe_seconds": transcribe_elapsed,
+                        "audio_seconds": round(chunk.duration, 3),
+                        "real_time_factor": round(transcribe_elapsed / chunk.duration, 4) if chunk.duration else None,
+                        "language": getattr(info, "language", None),
+                        "language_probability": getattr(info, "language_probability", None),
+                    }
+                )
 
-        stage_started = perf_counter()
-        self._progress(progress_callback, 0.92, "постобработка")
-        merged_segments = merge_segments(all_segments, int(params.get("chunk_overlap_seconds") or self.settings.chunk_overlap_seconds))
-        merged_segments, artifact_stats = replace_transcript_artifacts(merged_segments)
-        full_text = " ".join(segment["text"] for segment in merged_segments)
-        diagnostics["stage_timings"]["postprocess_seconds"] = elapsed_since(stage_started)
-        diagnostics["merged_segments"] = len(merged_segments)
-        diagnostics["artifact_postprocessing"] = artifact_stats
-        diagnostics["glossary"] = glossary_context.diagnostics()
+            stage_started = perf_counter()
+            self._progress(progress_callback, 0.92, "постобработка")
+            merged_segments = merge_segments(all_segments, overlap_seconds)
+            merged_segments, artifact_stats = replace_transcript_artifacts(merged_segments)
+            full_text = " ".join(segment["text"] for segment in merged_segments)
+            diagnostics["stage_timings"]["postprocess_seconds"] = elapsed_since(stage_started)
+            diagnostics["merged_segments"] = len(merged_segments)
+            diagnostics["artifact_postprocessing"] = artifact_stats
+            diagnostics["glossary"] = glossary_context.diagnostics()
 
-        stage_started = perf_counter()
-        exports = write_exports(
-            transcript_dir=transcript_dir,
-            job_id=job_id,
-            text=full_text,
-            segments=merged_segments,
-            metadata=diagnostics,
-        )
-        diagnostics["stage_timings"]["export_seconds"] = elapsed_since(stage_started)
-        elapsed_seconds = perf_counter() - started
-        diagnostics["elapsed_seconds"] = round(elapsed_seconds, 3)
-        diagnostics["real_time_factor"] = round(elapsed_seconds / duration_seconds, 4) if duration_seconds else None
-        exports["json"].write_text(
-            json.dumps({"text": full_text, "segments": merged_segments, "metadata": diagnostics}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        (transcript_dir / "diagnostics.json").write_text(
-            json.dumps(diagnostics, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        if chunk_dir.exists():
-            shutil.rmtree(chunk_dir)
-            logger.info("Удалены временные WAV-фрагменты: %s", chunk_dir)
+            stage_started = perf_counter()
+            exports = write_exports(
+                transcript_dir=transcript_dir,
+                job_id=job_id,
+                text=full_text,
+                segments=merged_segments,
+            )
+            diagnostics["stage_timings"]["export_seconds"] = elapsed_since(stage_started)
+
+            # Finalize all timings before writing JSON — written exactly once with complete data.
+            elapsed_seconds = perf_counter() - started
+            diagnostics["elapsed_seconds"] = round(elapsed_seconds, 3)
+            diagnostics["real_time_factor"] = round(elapsed_seconds / duration_seconds, 4) if duration_seconds else None
+            exports["json"].write_text(
+                json.dumps({"text": full_text, "segments": merged_segments, "metadata": diagnostics}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            (transcript_dir / "diagnostics.json").write_text(
+                json.dumps(diagnostics, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        finally:
+            # Always clean up chunk WAVs — on success and on error.
+            if chunk_dir.exists():
+                shutil.rmtree(chunk_dir, ignore_errors=True)
+                logger.info("Удалены временные WAV-фрагменты: %s", chunk_dir)
+
         self._progress(progress_callback, 0.98, "сохранение результатов")
         return {
             "text": full_text,

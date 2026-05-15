@@ -67,7 +67,7 @@ def main() -> None:
 
     repo = JobRepository(settings.database_path)
     name = worker_id()
-    recovered = repo.recover_running_jobs()
+    recovered = repo.recover_running_jobs(worker_id=name)
     if recovered:
         logger.info("Восстановлено незавершенных задач после перезапуска: %s", recovered)
 
@@ -81,6 +81,13 @@ def main() -> None:
     # ВАЖНО: CTranslate2 не потокобезопасен — один pipeline рассчитан на WORKER_CONCURRENCY=1.
     # При concurrency > 1 каждому потоку нужен собственный экземпляр TranscriptionPipeline.
     pipeline = TranscriptionPipeline(settings)
+    if settings.worker_concurrency > 1:
+        logger.warning(
+            "WORKER_CONCURRENCY=%d > 1, но CTranslate2 не потокобезопасен. "
+            "Все задачи будут сериализованы через один pipeline (риск race condition). "
+            "Рекомендуется WORKER_CONCURRENCY=1.",
+            settings.worker_concurrency,
+        )
     active: set[Future] = set()
     with ThreadPoolExecutor(max_workers=max(1, settings.worker_concurrency)) as executor:
         while not stop_requested:
@@ -94,7 +101,12 @@ def main() -> None:
             if active:
                 done, active = wait(active, timeout=settings.worker_poll_seconds, return_when=FIRST_COMPLETED)
                 for future in done:
-                    future.result()
+                    try:
+                        future.result()
+                    except Exception:
+                        # process_job handles all exceptions internally (logs + fail_job).
+                        # Re-raising here would kill the worker loop.
+                        pass
             else:
                 time.sleep(settings.worker_poll_seconds)
 

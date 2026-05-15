@@ -12,7 +12,11 @@
       "Bash(python -c \"import ast, sys; ast.parse\\(open\\('backend/app/main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
       "Bash(Get-ChildItem -Path \"c:\\\\BauerAI\\\\whisperio2\\\\\" -Force | Select-Object Name, FullName | Format-List)",
       "Bash(python c:/BauerAI/whisperio2/data/transcripts/f0d08271cd8b4ed9ae7cdaae37f54a9f/diagnostics.json)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(Get-ChildItem -Path \"c:\\\\BauerAI\\\\whisperio2\" -Recurse -Force)",
+      "Bash(Select-Object FullName)",
+      "PowerShell(head -100)",
+      "Bash(grep -E \"\\\\.\\(md|txt|yml|yaml|env|toml\\)$\")"
     ]
   }
 }

@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     max_upload_mb: int = 5120
     allowed_extensions: str = "*"
 
-    default_profile: Literal["accuracy_first"] = "accuracy_first"
+    default_profile: Literal["accuracy_first", "speed_balanced"] = "accuracy_first"
     whisper_model: str = "large-v3"
     whisper_device: str = "cuda"
     whisper_compute_type: str = "float16"

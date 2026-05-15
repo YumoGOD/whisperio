@@ -109,17 +109,28 @@ def parse_term(payload: dict[str, Any], source: Literal["global", "dynamic"]) ->
         min_words = int(payload.get("min_words") or 0)
     except (TypeError, ValueError):
         min_words = 0
+    validated_replacements: list[dict[str, str]] = []
+    for item in replacements:
+        if not isinstance(item, dict):
+            continue
+        pattern = str(item.get("from") or "").strip()
+        if not pattern:
+            continue
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(
+                f"Некорректный regex в термине {canonical!r}: {pattern!r} — {exc}"
+            ) from exc
+        validated_replacements.append({"from": pattern, "to": str(item.get("to") or canonical)})
+
     return GlossaryTerm(
         canonical=canonical,
         mode=mode,  # type: ignore[arg-type]
         category=str(payload.get("category") or "term").strip() or "term",
         spoken_forms=[str(item).strip() for item in spoken_forms if str(item).strip()],
         description=description,
-        replacements=[
-            {"from": str(item.get("from") or ""), "to": str(item.get("to") or canonical)}
-            for item in replacements
-            if isinstance(item, dict) and str(item.get("from") or "").strip()
-        ],
+        replacements=validated_replacements,
         source=source,
         min_words=max(0, min_words),
     )
@@ -198,7 +209,8 @@ def select_prompt_terms(params: dict[str, Any], terms: list[GlossaryTerm]) -> li
 
 
 def glossary_tokens(text: str) -> list[str]:
-    return [token for token in re.findall(r"[\wа-яА-ЯёЁ]{4,}", text.casefold()) if token]
+    # \w with Python Unicode already includes Cyrillic — no need for explicit range.
+    return [token for token in re.findall(r"\w{4,}", text.casefold()) if token]
 
 
 def build_prompt(settings: Settings, params: dict[str, Any], terms: list[GlossaryTerm]) -> str | None:
@@ -255,7 +267,11 @@ def apply_hard_normalization(
         for replacement in replacements:
             pattern = replacement["from"]
             target = replacement.get("to") or term.canonical
-            normalized, count = re.subn(pattern, target, normalized, flags=re.IGNORECASE)
+            try:
+                normalized, count = re.subn(pattern, target, normalized, flags=re.IGNORECASE)
+            except re.error as exc:
+                logger.warning("Ошибка regex для термина %r: %s", term.canonical, exc)
+                continue
             context.replacement_stats.add(term.canonical, count)
     return normalized
 
@@ -306,7 +322,7 @@ def looks_like_prompt_echo(text: str, initial_prompt: str | None) -> bool:
     long_words = [w for w in text_words if len(w) >= 4]
     if not long_words:
         return False
-    return sum(1 for w in long_words if w in prompt_word_set) / len(long_words) >= 0.80
+    return sum(1 for w in long_words if w in prompt_word_set) / len(long_words) >= 0.90
 
 
 def find_repeated_phrase(text: str) -> str | None:
@@ -326,14 +342,19 @@ def find_repeated_phrase(text: str) -> str | None:
             return originals[key]
 
     words = normalized.split()
-    for size in range(2, min(7, len(words) // 3 + 1)):
-        chunks = [" ".join(words[index : index + size]) for index in range(0, len(words) - size + 1, size)]
-        if not chunks:
-            continue
-        first = re.sub(r"[^\wа-яА-ЯёЁ]+", " ", chunks[0].casefold()).strip()
-        repeats = sum(1 for chunk in chunks if re.sub(r"[^\wа-яА-ЯёЁ]+", " ", chunk.casefold()).strip() == first)
-        if repeats >= 4:
-            return chunks[0]
+    # Check all alignment offsets (0..size-1) so shifted repetitions aren't missed.
+    for size in range(2, min(7, len(words) // 4 + 1)):
+        for offset in range(size):
+            sub_chunks = [" ".join(words[i : i + size]) for i in range(offset, len(words) - size + 1, size)]
+            if not sub_chunks:
+                continue
+            first = re.sub(r"[^\w]+", " ", sub_chunks[0].casefold()).strip()
+            repeats = sum(
+                1 for chunk in sub_chunks
+                if re.sub(r"[^\w]+", " ", chunk.casefold()).strip() == first
+            )
+            if repeats >= 4:
+                return sub_chunks[0]
     return None
 
 

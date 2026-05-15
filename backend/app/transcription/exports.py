@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -74,7 +73,6 @@ def write_exports(
     job_id: str,
     text: str,
     segments: list[dict[str, Any]],
-    metadata: dict[str, Any],
 ) -> dict[str, Path]:
     transcript_dir.mkdir(parents=True, exist_ok=True)
     paths = {
@@ -85,11 +83,9 @@ def write_exports(
         "docx": transcript_dir / f"{job_id}.docx",
     }
     paths["txt"].write_text(text.strip() + "\n", encoding="utf-8")
-    paths["json"].write_text(
-        json.dumps({"text": text, "segments": segments, "metadata": metadata}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
     paths["srt"].write_text(segments_to_srt(segments), encoding="utf-8")
     paths["vtt"].write_text(segments_to_vtt(segments), encoding="utf-8")
     write_docx_export(paths["docx"], segments)
+    # JSON is intentionally NOT written here — pipeline.py writes it once
+    # after all stage timings (export_seconds, elapsed_seconds, rtf) are finalized.
     return paths
