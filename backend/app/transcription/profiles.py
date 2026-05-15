@@ -11,6 +11,8 @@ PROFILES: dict[str, dict[str, Any]] = {
         # Зашумлённые лекции. Приоритет — полнота, безопасность границ сегментов.
         # beam_size=5/patience=1.0 — расширенный поиск; condition_on_previous_text=False
         # предотвращает галлюцинации на границах 30-секундных окон.
+        # no_speech_threshold=0.85: Whisper пропускает 30-сек окно только при очень высокой
+        # уверенности в тишине; значение 0.60 стабильно отбрасывало первое окно с чёткой речью.
         "description": "Noisy lecture profile. Prefer recall and boundary safety over speed.",
         "beam_size": 5,
         "best_of": 5,
@@ -18,7 +20,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "temperature": [0.0, 0.2, 0.4, 0.6],
         "compression_ratio_threshold": 2.4,
         "log_prob_threshold": -1.0,
-        "no_speech_threshold": 0.60,
+        "no_speech_threshold": 0.85,
         "condition_on_previous_text": False,
         "word_timestamps": False,
         "vad_filter": False,
@@ -31,7 +33,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "temperature": [0.0, 0.2],
         "compression_ratio_threshold": 2.4,
         "log_prob_threshold": -1.0,
-        "no_speech_threshold": 0.60,
+        "no_speech_threshold": 0.85,
         "condition_on_previous_text": False,
         "word_timestamps": False,
         "vad_filter": True,
@@ -50,6 +52,26 @@ def resolve_profile(profile_name: str, settings: Settings) -> dict[str, Any]:
         raise ValueError(f"Неизвестный профиль транскрибации '{profile_name}'. Доступные профили: {available}")
 
     profile = deepcopy(PROFILES[profile_name])
+
+    # Decode parameter overrides from .env (apply only when explicitly set).
+    if settings.whisper_no_speech_threshold is not None:
+        profile["no_speech_threshold"] = settings.whisper_no_speech_threshold
+    if settings.whisper_log_prob_threshold is not None:
+        profile["log_prob_threshold"] = settings.whisper_log_prob_threshold
+    if settings.whisper_compression_ratio_threshold is not None:
+        profile["compression_ratio_threshold"] = settings.whisper_compression_ratio_threshold
+    if settings.whisper_beam_size is not None:
+        profile["beam_size"] = settings.whisper_beam_size
+    if settings.whisper_best_of is not None:
+        profile["best_of"] = settings.whisper_best_of
+    if settings.whisper_patience is not None:
+        profile["patience"] = settings.whisper_patience
+    if settings.whisper_condition_on_previous_text is not None:
+        profile["condition_on_previous_text"] = settings.whisper_condition_on_previous_text
+    if settings.whisper_word_timestamps is not None:
+        profile["word_timestamps"] = settings.whisper_word_timestamps
+
+    # VAD overrides.
     if settings.vad_filter is not None:
         profile["vad_filter"] = settings.vad_filter
     vad_parameters = profile.setdefault("vad_parameters", {})

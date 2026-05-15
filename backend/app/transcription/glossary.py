@@ -322,7 +322,9 @@ def looks_like_prompt_echo(text: str, initial_prompt: str | None) -> bool:
     long_words = [w for w in text_words if len(w) >= 4]
     if not long_words:
         return False
-    return sum(1 for w in long_words if w in prompt_word_set) / len(long_words) >= 0.90
+    # 0.95 instead of 0.90: domain-specific speech naturally shares vocabulary with the
+    # glossary prompt; 0.90 caused legitimate first-window segments to be dropped.
+    return sum(1 for w in long_words if w in prompt_word_set) / len(long_words) >= 0.95
 
 
 def find_repeated_phrase(text: str) -> str | None:
