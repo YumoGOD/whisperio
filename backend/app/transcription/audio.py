@@ -46,26 +46,7 @@ def extract_chunk(input_path: Path, output_path: Path, start: float, duration: f
     if output_path.exists() and output_path.stat().st_size > 0:
         return output_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
-<<<<<<< HEAD
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-ss",
-        f"{start:.3f}",
-        "-t",
-        f"{duration:.3f}",
-        "-i",
-        str(input_path),
-        "-vn",
-        "-ac",
-        "1",
-        "-ar",
-        str(settings.target_sample_rate),
-    ]
-=======
     filters = []
->>>>>>> claude/zealous-kare-20eb80
     if settings.enable_loudnorm:
         # Single-pass voice filter: removes sub-200 Hz rumble, >8 kHz noise, boosts quiet audio.
         filters.append("highpass=f=200,lowpass=f=8000,volume=1.5")
