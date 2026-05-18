@@ -62,15 +62,25 @@ def process_job(job: Job, repo: JobRepository, worker_name: str, pipeline: Trans
         repo.fail_job(job.id, str(exc))
 
 
+def _poll_once(name: str, repo: JobRepository, pipeline: TranscriptionPipeline) -> None:
+    """Одна итерация очереди: берёт одну задачу и обрабатывает. Возвращает управление сразу."""
+    try:
+        job = repo.claim_next_job(name)
+    except Exception as exc:
+        logger.warning("Ошибка при получении задачи из очереди (повтор через %.0f сек): %s", settings.worker_poll_seconds, exc)
+        time.sleep(settings.worker_poll_seconds)
+        return
+    if job is None:
+        time.sleep(settings.worker_poll_seconds)
+        return
+    process_job(job, repo, name, pipeline)
+
+
 def _run_worker_thread(name: str, repo: JobRepository, pipeline: TranscriptionPipeline) -> None:
     thread_label = threading.current_thread().name
     logger.info("Worker-поток %s запущен", thread_label)
     while not stop_requested:
-        job = repo.claim_next_job(name)
-        if job is None:
-            time.sleep(settings.worker_poll_seconds)
-            continue
-        process_job(job, repo, name, pipeline)
+        _poll_once(name, repo, pipeline)
     logger.info("Worker-поток %s остановлен", thread_label)
 
 
@@ -100,11 +110,7 @@ def main() -> None:
     if concurrency == 1:
         pipeline = TranscriptionPipeline(settings)
         while not stop_requested:
-            job = repo.claim_next_job(name)
-            if job is None:
-                time.sleep(settings.worker_poll_seconds)
-                continue
-            process_job(job, repo, name, pipeline)
+            _poll_once(name, repo, pipeline)
     else:
         # Каждый поток получает собственный экземпляр pipeline (и модели).
         pipelines = [TranscriptionPipeline(settings) for _ in range(concurrency)]

@@ -14,9 +14,27 @@ services:
       - ./data:/app/data
     restart: unless-stopped
 
-  # CPU-воркер: не требует GPU и NVIDIA-драйверов.
-  # Запуск: docker compose --profile cpu up
+  # GPU-воркер (по умолчанию). Требует NVIDIA Container Toolkit.
+  # Запуск: docker compose up
   worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m app.worker
+    env_file:
+      - .env
+    environment:
+      APP_ROLE: worker
+    gpus: all
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    depends_on:
+      - api
+
+  # CPU-воркер. Не требует GPU и NVIDIA-драйверов.
+  # Запуск: docker compose --profile cpu up --scale worker=0
+  worker-cpu:
     build:
       context: .
       dockerfile: Dockerfile.cpu
@@ -33,22 +51,3 @@ services:
     depends_on:
       - api
     profiles: [cpu]
-
-  # GPU-воркер: требует NVIDIA Container Toolkit и драйверов.
-  # Запуск: docker compose --profile gpu up
-  worker-gpu:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    command: python -m app.worker
-    env_file:
-      - .env
-    environment:
-      APP_ROLE: worker
-    gpus: all
-    volumes:
-      - ./data:/app/data
-    restart: unless-stopped
-    depends_on:
-      - api
-    profiles: [gpu]

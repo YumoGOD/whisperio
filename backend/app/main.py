@@ -670,7 +670,7 @@ def job_page(job_id: str) -> str:
     whisper_html = render_kv(
         [
             ("Модель", runtime_settings.get("model") or job.params.get("model") or settings.whisper_model),
-            ("Устройство", runtime_settings.get("device") or "cuda"),
+            ("Устройство", runtime_settings.get("device") or settings.whisper_device),
             ("Тип вычислений", runtime_settings.get("compute_type") or job.params.get("compute_type") or settings.whisper_compute_type),
             ("Язык", runtime_settings.get("language") or job.params.get("language") or settings.whisper_language or "auto"),
             ("Задача Whisper", runtime_settings.get("task") or job.params.get("task") or settings.whisper_task),
