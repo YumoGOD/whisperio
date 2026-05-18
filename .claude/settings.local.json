@@ -16,7 +16,8 @@
       "Bash(Get-ChildItem -Path \"c:\\\\BauerAI\\\\whisperio2\" -Recurse -Force)",
       "Bash(Select-Object FullName)",
       "PowerShell(head -100)",
-      "Bash(grep -E \"\\\\.\\(md|txt|yml|yaml|env|toml\\)$\")"
+      "Bash(grep -E \"\\\\.\\(md|txt|yml|yaml|env|toml\\)$\")",
+      "Read(//c/Users/Admin/Downloads/**)"
     ]
   }
 }

@@ -12,8 +12,6 @@ services:
       - ./data:/app/data
     restart: unless-stopped
 
-  # GPU-воркер. Требует NVIDIA Container Toolkit на хосте.
-  # Активируется профилем: COMPOSE_PROFILES=gpu (задайте в .env)
   worker:
     build: .
     command: python -m app.worker
@@ -21,28 +19,8 @@ services:
       - .env
     environment:
       APP_ROLE: worker
-    gpus: all
     volumes:
       - ./data:/app/data
     restart: unless-stopped
     depends_on:
       - api
-    profiles: [gpu]
-
-  # CPU-воркер. Не требует GPU и NVIDIA-драйверов.
-  # Активируется профилем: COMPOSE_PROFILES=cpu (задайте в .env)
-  worker-cpu:
-    build: .
-    command: python -m app.worker
-    env_file:
-      - .env
-    environment:
-      APP_ROLE: worker
-      WHISPER_DEVICE: cpu
-      WHISPER_COMPUTE_TYPE: int8
-    volumes:
-      - ./data:/app/data
-    restart: unless-stopped
-    depends_on:
-      - api
-    profiles: [cpu]
