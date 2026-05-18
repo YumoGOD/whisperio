@@ -150,11 +150,12 @@ class TranscriptionPipeline:
                     logger.warning("Попытка %d/3 не удалась: %s", attempt + 1, exc)
                     if attempt == 2:
                         raise
-                    try:
-                        import torch
-                        torch.cuda.empty_cache()
-                    except ImportError:
-                        pass
+                    if self.settings.whisper_device == "cuda":
+                        try:
+                            import torch
+                            torch.cuda.empty_cache()
+                        except ImportError:
+                            pass
                     if attempt == 0:
                         profile_attempt["beam_size"] = max(1, profile["beam_size"] - 2)
                         profile_attempt["best_of"] = max(1, profile["best_of"] - 2)
