@@ -1,8 +1,6 @@
 services:
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile.cpu
+    build: .
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     env_file:
       - .env
@@ -14,12 +12,10 @@ services:
       - ./data:/app/data
     restart: unless-stopped
 
-  # GPU-воркер (по умолчанию). Требует NVIDIA Container Toolkit.
-  # Запуск: docker compose up
+  # GPU-воркер. Требует NVIDIA Container Toolkit на хосте.
+  # Активируется профилем: COMPOSE_PROFILES=gpu (задайте в .env)
   worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
     command: python -m app.worker
     env_file:
       - .env
@@ -31,13 +27,12 @@ services:
     restart: unless-stopped
     depends_on:
       - api
+    profiles: [gpu]
 
   # CPU-воркер. Не требует GPU и NVIDIA-драйверов.
-  # Запуск: docker compose --profile cpu up --scale worker=0
+  # Активируется профилем: COMPOSE_PROFILES=cpu (задайте в .env)
   worker-cpu:
-    build:
-      context: .
-      dockerfile: Dockerfile.cpu
+    build: .
     command: python -m app.worker
     env_file:
       - .env
