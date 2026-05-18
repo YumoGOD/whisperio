@@ -1,0 +1,30 @@
+# Whisper Transcription Service — backend dependencies
+# Python 3.11
+#
+# PyTorch + CUDA 12.x:
+#   Колёса torch / torchaudio для CUDA не лежат в PyPI. Ставь их одной командой,
+#   ПЕРЕД этим requirements, чтобы версии совпали (иначе silero-vad подтянет
+#   несовместимый torchaudio с PyPI и упадёт при импорте):
+#     pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+#   На dev-машине без GPU — CPU-сборка теми же командами:
+#     pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+#   После этого:
+#     pip install -r requirements.txt
+
+# ===== Web framework =====
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+
+# ===== DB / settings =====
+sqlalchemy==2.0.36
+pydantic==2.10.4
+pydantic-settings==2.7.0
+
+# ===== ML / audio =====
+faster-whisper==1.1.0
+ffmpeg-python==0.2.0
+silero-vad==5.1.2
+# Аудио-бэкенд для torchaudio (нужен silero-vad для чтения WAV). Без него:
+# "The list of available backends is empty".
+soundfile==0.12.1
