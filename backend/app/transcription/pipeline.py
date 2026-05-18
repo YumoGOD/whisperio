@@ -43,11 +43,12 @@ class TranscriptionPipeline:
         if self._model is None:
             model_name = self.settings.whisper_model
             logger.info(
-                "Загрузка модели faster-whisper: model=%s device=%s compute_type=%s num_workers=%d",
+                "Загрузка модели faster-whisper: model=%s device=%s compute_type=%s num_workers=%d cpu_threads=%d",
                 model_name,
                 self.settings.whisper_device,
                 self.settings.whisper_compute_type,
                 self.settings.whisper_num_workers,
+                self.settings.whisper_cpu_threads,
             )
             try:
                 whisper_model = WhisperModel(
@@ -55,6 +56,7 @@ class TranscriptionPipeline:
                     device=self.settings.whisper_device,
                     compute_type=self.settings.whisper_compute_type,
                     num_workers=self.settings.whisper_num_workers,
+                    cpu_threads=self.settings.whisper_cpu_threads,
                     download_root=str(self.settings.whisper_download_root)
                     if self.settings.whisper_download_root
                     else None,

@@ -4,8 +4,10 @@ import logging
 import os
 import signal
 import socket
+import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from app.config import get_settings
@@ -23,7 +25,7 @@ stop_requested = False
 
 def request_stop(signum, _frame) -> None:
     global stop_requested
-    logger.info("Получен сигнал %s, остановка после завершения активной задачи", signum)
+    logger.info("Получен сигнал %s, остановка после завершения активных задач", signum)
     stop_requested = True
 
 
@@ -60,6 +62,18 @@ def process_job(job: Job, repo: JobRepository, worker_name: str, pipeline: Trans
         repo.fail_job(job.id, str(exc))
 
 
+def _run_worker_thread(name: str, repo: JobRepository, pipeline: TranscriptionPipeline) -> None:
+    thread_label = threading.current_thread().name
+    logger.info("Worker-поток %s запущен", thread_label)
+    while not stop_requested:
+        job = repo.claim_next_job(name)
+        if job is None:
+            time.sleep(settings.worker_poll_seconds)
+            continue
+        process_job(job, repo, name, pipeline)
+    logger.info("Worker-поток %s остановлен", thread_label)
+
+
 def main() -> None:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
@@ -70,17 +84,40 @@ def main() -> None:
     if recovered:
         logger.info("Восстановлено незавершённых задач после перезапуска: %s", recovered)
 
-    logger.info("Worker %s запущен, интервал опроса=%.1f сек.", name, settings.worker_poll_seconds)
+    concurrency = settings.worker_concurrency
+    logger.info(
+        "Worker %s запущен, concurrency=%d, интервал опроса=%.1f сек.",
+        name, concurrency, settings.worker_poll_seconds,
+    )
 
-    # Модель загружается лениво — при первой задаче.
-    pipeline = TranscriptionPipeline(settings)
+    if concurrency > 1 and settings.whisper_device == "cuda":
+        logger.warning(
+            "worker_concurrency=%d при device=cuda: каждый поток загружает отдельную копию модели в VRAM. "
+            "Убедитесь, что видеопамяти достаточно.",
+            concurrency,
+        )
 
-    while not stop_requested:
-        job = repo.claim_next_job(name)
-        if job is None:
-            time.sleep(settings.worker_poll_seconds)
-            continue
-        process_job(job, repo, name, pipeline)
+    if concurrency == 1:
+        pipeline = TranscriptionPipeline(settings)
+        while not stop_requested:
+            job = repo.claim_next_job(name)
+            if job is None:
+                time.sleep(settings.worker_poll_seconds)
+                continue
+            process_job(job, repo, name, pipeline)
+    else:
+        # Каждый поток получает собственный экземпляр pipeline (и модели).
+        pipelines = [TranscriptionPipeline(settings) for _ in range(concurrency)]
+        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="worker") as executor:
+            futures = [
+                executor.submit(_run_worker_thread, name, repo, pipelines[i])
+                for i in range(concurrency)
+            ]
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as exc:
+                    logger.error("Worker-поток завершился с ошибкой: %s\n%s", exc, traceback.format_exc())
 
     logger.info("Worker %s остановлен", name)
 

@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     whisper_device: str = "cuda"
     whisper_compute_type: str = "float16"
     whisper_num_workers: int = 1
+    whisper_cpu_threads: int = Field(default=0, ge=0)
     whisper_download_root: Path | None = Path("./data/models")
     whisper_language: str | None = "ru"
     whisper_task: Literal["transcribe", "translate"] = "transcribe"
@@ -47,6 +48,7 @@ class Settings(BaseSettings):
 
     worker_poll_seconds: float = 5.0
     worker_id: str | None = None
+    worker_concurrency: int = Field(default=1, ge=1, le=16)
 
     enable_loudnorm: bool = True
     target_sample_rate: int = 16000
